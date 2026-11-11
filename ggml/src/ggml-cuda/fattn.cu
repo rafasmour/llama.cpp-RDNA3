@@ -757,6 +757,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
 
+    // The tile kernel reads quantized K/V directly for small batches and shares the reads between the Q heads of one KV head.
+    if (gqa_opt_applies && ggml_cuda_fattn_tile_direct_kv(cc, dst)) {
+        return BEST_FATTN_KERNEL_TILE;
+    }
+
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
             Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
@@ -797,6 +802,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
+            if (ggml_cuda_fattn_tile_direct_kv(ggml_cuda_info().devices[device].cc, dst)) {
+                break;
+            }
+            need_f16_K = true;
+            need_f16_V = true;
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
