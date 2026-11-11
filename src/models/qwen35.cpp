@@ -392,6 +392,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
 
         alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+        alpha = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
         alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     }
     cb(beta, "beta", il);
@@ -400,7 +401,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
+    // without the concatenated weight the bias follows the mul_mat directly (added before the reshape), so it can be fused
+    ggml_tensor * alpha_biased = model.layers[il].ssm_beta_alpha_cat ? ggml_add(ctx0, alpha, model.layers[il].ssm_dt) : alpha;
     ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
     cb(alpha_softplus, "a_softplus", il);
 
