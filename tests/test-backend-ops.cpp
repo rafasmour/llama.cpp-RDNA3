@@ -8050,6 +8050,7 @@ enum mul_mat_add_mode {
     MUL_MAT_ADD_RES_INPLACE, // res += mm
     MUL_MAT_ADD_B_INPLACE,   // b += mm: the sum overwrites the mat-mul input (m == k)
     MUL_MAT_ADD_MM_MM,       // mm2 + mm: the residual is itself a mat-mul output, so both operands are MUL_MAT
+    MUL_MAT_ADD_SHARED_B,    // two mat-muls read b, then b += mm and a third mat-mul reads the updated b (m == k)
 };
 
 static std::string var_to_str(mul_mat_add_mode mode) {
@@ -8060,6 +8061,7 @@ static std::string var_to_str(mul_mat_add_mode mode) {
         case MUL_MAT_ADD_RES_INPLACE: return "res+=mm";
         case MUL_MAT_ADD_B_INPLACE:   return "b+=mm";
         case MUL_MAT_ADD_MM_MM:       return "mm2+mm";
+        case MUL_MAT_ADD_SHARED_B:    return "shared_b";
     }
     return "unknown";
 }
@@ -8074,7 +8076,7 @@ struct test_mul_mat_add : public test_case {
 
     test_mul_mat_add(ggml_type type_a, int64_t m, int64_t n, int64_t k, mul_mat_add_mode mode = MUL_MAT_ADD_MM_RES)
         : type_a(type_a), m(m), n(n), k(k), mode(mode) {
-        GGML_ASSERT(mode != MUL_MAT_ADD_B_INPLACE || m == k);
+        GGML_ASSERT((mode != MUL_MAT_ADD_B_INPLACE && mode != MUL_MAT_ADD_SHARED_B) || m == k);
     }
 
     std::string vars() override {
@@ -8110,6 +8112,15 @@ struct test_mul_mat_add : public test_case {
                     ggml_tensor * a2  = ggml_new_tensor_2d(ctx, type_a, k, m);
                     ggml_tensor * mm2 = ggml_mul_mat(ctx, a2, b);
                     out = ggml_add(ctx, mm2, mm);
+                } break;
+            case MUL_MAT_ADD_SHARED_B:
+                {
+                    ggml_tensor * a2  = ggml_new_tensor_2d(ctx, type_a, k, m);
+                    ggml_tensor * a3  = ggml_new_tensor_2d(ctx, type_a, k, m);
+                    ggml_tensor * mm2 = ggml_mul_mat(ctx, a2, b);
+                    ggml_tensor * b2  = ggml_add_inplace(ctx, b, mm);
+                    ggml_tensor * mm3 = ggml_mul_mat(ctx, a3, b2);
+                    out = ggml_add(ctx, mm2, mm3);
                 } break;
         }
         ggml_set_name(out, "out");
@@ -11925,6 +11936,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_add(type_a, 1000, n, 1024, mode));
             }
             test_cases.emplace_back(new test_mul_mat_add(type_a, 2048, n, 2048, MUL_MAT_ADD_B_INPLACE));
+            test_cases.emplace_back(new test_mul_mat_add(type_a, 1024, n, 1024, MUL_MAT_ADD_SHARED_B));
         }
         // the widest tiles with two src1 tiles, and src1 rows padded in memory
         for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
