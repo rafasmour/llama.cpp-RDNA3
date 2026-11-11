@@ -792,6 +792,20 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :
     concurrent_stream_context(std::make_unique<ggml_cuda_stream_context>()) {
 }
 
+void ggml_backend_cuda_context::ggml_cuda_q8_1_cache::set(const ggml_tensor * src1) {
+    data    = src1->data;
+    src_end = (uintptr_t) src1->data + ggml_backend_buft_get_alloc_size(src1->buffer->buft, src1);
+    memcpy(ne, src1->ne, sizeof(ne));
+    memcpy(nb, src1->nb, sizeof(nb));
+}
+
+void ggml_backend_cuda_context::ggml_cuda_q8_1_cache::invalidate_if_written(const ggml_tensor * node) {
+    if (buf && (uintptr_t) node->data < src_end &&
+        (uintptr_t) data < (uintptr_t) node->data + ggml_backend_buft_get_alloc_size(node->buffer->buft, node)) {
+        clear();
+    }
+}
+
 #ifdef USE_CUDA_GRAPH
 ggml_cuda_graph * ggml_backend_cuda_context::cuda_graph(const void * first_node_ptr, int64_t time_now) {
     // Give all cached graphs 10s to be reused after an idle period, without updating each graph.
@@ -5334,9 +5348,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                cuda_ctx->q8_1_cache.invalidate_if_written(node);
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    for (int j = i + 1; j <= i + nodes_to_skip; j++) {
+                        cuda_ctx->q8_1_cache.invalidate_if_written(cgraph->nodes[j]);
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -5484,7 +5503,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    cuda_ctx->q8_1_cache.clear();
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    cuda_ctx->q8_1_cache.clear();
 
     return GGML_STATUS_SUCCESS;
 }

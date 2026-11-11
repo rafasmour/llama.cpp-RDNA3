@@ -1448,6 +1448,29 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // q8_1 copy of the last quantized mat-vec src1, shared by following mat-vecs with the same src1
+    struct ggml_cuda_q8_1_cache {
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
+        const void * data = nullptr;
+        int64_t      ne[GGML_MAX_DIMS] = {};
+        size_t       nb[GGML_MAX_DIMS] = {};
+        uintptr_t    src_end = 0; // the source memory range is [data, src_end)
+
+        bool matches(const ggml_tensor * src1) const {
+            return buf && data == src1->data &&
+                memcmp(ne, src1->ne, sizeof(ne)) == 0 && memcmp(nb, src1->nb, sizeof(nb)) == 0;
+        }
+
+        void set(const ggml_tensor * src1);
+        // drop the cache if it reads memory that the node writes
+        void invalidate_if_written(const ggml_tensor * node);
+
+        void clear() {
+            buf.reset();
+            data = nullptr;
+        }
+    } q8_1_cache;
 };
 
 struct ggml_cuda_mm_fusion_args_host {
