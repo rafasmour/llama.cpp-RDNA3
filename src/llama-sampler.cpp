@@ -2928,25 +2928,42 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
     }
 
     // Apply frequency and presence penalties to the cur_p
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
-        if (token_iter == ctx->token_count.end()) {
-            continue;
-        }
-
-        const int count = token_iter->second;
-
+    const auto apply = [&](llama_token_data & cur, const int count) {
         assert(count > 0 && count <= ctx->penalty_last_n);
 
         // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
         // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
-        if (cur_p->data[i].logit <= 0) {
-            cur_p->data[i].logit *= ctx->penalty_repeat;
+        if (cur.logit <= 0) {
+            cur.logit *= ctx->penalty_repeat;
         } else {
-            cur_p->data[i].logit /= ctx->penalty_repeat;
+            cur.logit /= ctx->penalty_repeat;
         }
 
-        cur_p->data[i].logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+        cur.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+    };
+
+    // the candidates are usually still in token order, then each penalized token is found by its index
+    bool indexed = true;
+    for (const auto & [token, count] : ctx->token_count) {
+        if (token < 0 || (size_t) token >= cur_p->size || cur_p->data[token].id != token) {
+            indexed = false;
+            break;
+        }
+    }
+
+    if (indexed) {
+        for (const auto & [token, count] : ctx->token_count) {
+            apply(cur_p->data[token], count);
+        }
+    } else {
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
+            if (token_iter == ctx->token_count.end()) {
+                continue;
+            }
+
+            apply(cur_p->data[i], token_iter->second);
+        }
     }
 
     cur_p->sorted = false;
