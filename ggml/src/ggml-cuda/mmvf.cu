@@ -400,6 +400,15 @@ static __global__ void mul_mat_vec_f(
             value += x_bias[tid*stride_col_dst + row];
         }
 
+        if (fusion.unary_op == GGML_UNARY_OP_SIGMOID) {
+            value = ggml_cuda_op_sigmoid_single(value);
+        } else if (fusion.unary_op == GGML_UNARY_OP_SOFTPLUS) {
+            value = ggml_cuda_op_softplus_single(value);
+        }
+        if (fusion.unary_mul) {
+            value *= static_cast<const float *>(fusion.unary_mul)[row];
+        }
+
         if (use_gate) {
             float gate_value = sumf_gate[tid];
             if (use_gate_scale) {
@@ -451,7 +460,7 @@ static void mul_mat_vec_f_switch_fusion(
     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-        fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+        fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.unary_op != GGML_UNARY_OP_COUNT;
     if constexpr (ncols_dst == 1) {
         if (has_fusion) {
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
@@ -749,6 +758,18 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             GGML_ASSERT(ggml_is_contiguous(fusion->gate_scale));
             GGML_ASSERT(ggml_nelements(fusion->gate_scale) == (ids ? src0->ne[2] : 1));
             fusion_local.gate_scale = fusion->gate_scale->data;
+        }
+        if (fusion->unary_op != GGML_UNARY_OP_COUNT) {
+            GGML_ASSERT(!ids && !fusion->gate);
+            GGML_ASSERT(fusion->unary_op == GGML_UNARY_OP_SIGMOID || fusion->unary_op == GGML_UNARY_OP_SOFTPLUS);
+            fusion_local.unary_op = fusion->unary_op;
+        }
+        if (fusion->unary_mul) {
+            GGML_ASSERT(fusion->unary_op != GGML_UNARY_OP_COUNT);
+            GGML_ASSERT(fusion->unary_mul->type == GGML_TYPE_F32);
+            GGML_ASSERT(ggml_is_contiguous(fusion->unary_mul));
+            GGML_ASSERT(fusion->unary_mul->ne[0] == dst->ne[0]);
+            fusion_local.unary_mul = fusion->unary_mul->data;
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
