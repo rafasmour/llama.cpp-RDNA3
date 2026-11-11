@@ -1101,6 +1101,9 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // rollback slot order of the conv state store, shared by the conv layers when they all run on one device
+    mutable ggml_tensor * inp_s_slot_rev = nullptr;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 
