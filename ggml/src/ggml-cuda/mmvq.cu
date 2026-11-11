@@ -504,18 +504,18 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         return 1;
     }
     if (table_id == MMVQ_PARAMETERS_RDNA3_0) {
-        // RDNA3 (W7900): stricter whitelist than RDNA4.
-        // Q2_K / Q5_K / IQ4_XS regress in full quant sweeps.
-        if (ncols_dst == 1) {
+        // RDNA3 (RX 7900 XT): rows shorter than one loop trip of the block (small_k) and the IQ types want a single warp.
+        if (ncols_dst == 1 && !small_k) {
             switch (type) {
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_Q4_1:
                 case GGML_TYPE_Q5_0:
                 case GGML_TYPE_Q5_1:
-                case GGML_TYPE_Q8_0:
-                    return 8;
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
                 case GGML_TYPE_Q6_K:
-                    return 2;
+                    return 4;
+                case GGML_TYPE_Q8_0:
                 case GGML_TYPE_IQ4_NL:
                     return 8;
                 default:
@@ -1175,7 +1175,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             }
         } else if ((ncols_dst == 1 && std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end()) ||
                 (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||
-                GGML_CUDA_CC_IS_RDNA(cc)) {
+                (GGML_CUDA_CC_IS_RDNA(cc) && !GGML_CUDA_CC_IS_RDNA3_0(cc))) {
             use = false;
         }
 
