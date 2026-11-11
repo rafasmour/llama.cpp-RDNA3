@@ -17,6 +17,20 @@ static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * 
     return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
 }
 
+// l2-normalise q and k with one op, they are adjacent head_k_dim x num_k_heads blocks at the start of the conv output
+static inline std::pair<ggml_tensor *, ggml_tensor *> build_gdn_l2_norm_qk(
+        ggml_context * ctx, ggml_tensor * qkv, int64_t head_k_dim, int64_t num_k_heads, int64_t n_seq_tokens, int64_t n_seqs, float eps) {
+    ggml_tensor * qk = ggml_view_4d(ctx, qkv, head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(qkv->type, head_k_dim), qkv->nb[1], qkv->nb[2], 0);
+
+    qk = build_gdn_l2_norm(ctx, qk, eps);
+
+    ggml_tensor * q = ggml_view_4d(ctx, qk, head_k_dim, num_k_heads, n_seq_tokens, n_seqs, qk->nb[1], qk->nb[2], qk->nb[3], 0);
+    ggml_tensor * k = ggml_view_4d(ctx, qk, head_k_dim, num_k_heads, n_seq_tokens, n_seqs, qk->nb[1], qk->nb[2], qk->nb[3], num_k_heads * qk->nb[1]);
+
+    return { q, k };
+}
+
 //
 // base classes
 //
