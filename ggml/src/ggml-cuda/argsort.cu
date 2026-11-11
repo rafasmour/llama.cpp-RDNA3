@@ -1,14 +1,19 @@
 #include "argsort.cuh"
 
-#ifdef GGML_CUDA_USE_CUB
-#    include <cub/cub.cuh>
+#ifdef GGML_CUDA_USE_CUB_ARGSORT
+#    ifdef GGML_USE_HIP
+#        include <hipcub/hipcub.hpp>
+namespace cub = hipcub;
+#    else
+#        include <cub/cub.cuh>
+#    endif  // GGML_USE_HIP
     // strided_iterator was added in CCCL 3.1
 #    if (CCCL_MAJOR_VERSION > 3 || (CCCL_MAJOR_VERSION == 3 && CCCL_MINOR_VERSION >= 1))
 #        define STRIDED_ITERATOR_AVAILABLE
 #        include <cuda/iterator>
 #    endif
 using namespace cub;
-#endif  // GGML_CUDA_USE_CUB
+#endif  // GGML_CUDA_USE_CUB_ARGSORT
 
 static __global__ void init_indices(int * indices, const int ncols, const int nrows) {
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -41,7 +46,7 @@ int ggml_cuda_chunk_nrows(const size_t row_bytes, const int64_t nrows) {
     return std::min((int64_t) chunk_nrows, nrows);
 }
 
-#ifdef GGML_CUDA_USE_CUB
+#ifdef GGML_CUDA_USE_CUB_ARGSORT
 
 void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
                               const float *    x,
@@ -157,7 +162,7 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
         }
     }
 }
-#endif  // GGML_CUDA_USE_CUB
+#endif  // GGML_CUDA_USE_CUB_ARGSORT
 
 // Bitonic sort implementation
 template<typename T>
@@ -279,7 +284,7 @@ void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     enum ggml_sort_order order = (enum ggml_sort_order) dst->op_params[0];
 
-#ifdef GGML_CUDA_USE_CUB
+#ifdef GGML_CUDA_USE_CUB_ARGSORT
     const int    ncols_pad      = next_power_of_2(ncols);
     const size_t shared_mem     = ncols_pad * sizeof(int);
     const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;

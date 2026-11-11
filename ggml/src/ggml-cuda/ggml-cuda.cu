@@ -6512,7 +6512,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TOP_K:
             return op->src[0]->ne[0] <= INT_MAX;
         case GGML_OP_ARGSORT:
-#ifndef GGML_CUDA_USE_CUB
+#ifndef GGML_CUDA_USE_CUB_ARGSORT
             {
                 // bitonic path: the padded row must fit in shared memory
                 int64_t ncols_pad = 1;

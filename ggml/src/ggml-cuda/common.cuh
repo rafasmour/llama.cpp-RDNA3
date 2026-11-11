@@ -117,6 +117,11 @@
 #    define GGML_CUDA_USE_CUB
 #endif  // !defined(GGML_USE_HIP) && (defined(GGML_USE_MUSA) || CUDART_VERSION >= 11070)
 
+// device-wide sort for ARGSORT, on HIP through hipCUB
+#if defined(GGML_CUDA_USE_CUB) || (defined(GGML_USE_HIP) && __has_include(<hipcub/hipcub.hpp>))
+#    define GGML_CUDA_USE_CUB_ARGSORT
+#endif  // defined(GGML_CUDA_USE_CUB) || (defined(GGML_USE_HIP) && __has_include(<hipcub/hipcub.hpp>))
+
 // PDL host-side support (cudaLaunchKernelEx) requires CUDART >= 11.8.
 // However, this has been bugged in CTK < 12.3 for MSVC builds, see
 // https://github.com/ggml-org/llama.cpp/pull/22522#discussion_r3302393293
