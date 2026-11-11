@@ -187,6 +187,9 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // true if the states of the first n_seqs cells are already in place, i.e. s_copy(i) == head + i
+    bool is_s_copy_identity(uint32_t n_seqs) const;
+
 private:
     const llama_memory_status status;
 
