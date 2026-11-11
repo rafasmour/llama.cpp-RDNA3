@@ -377,32 +377,38 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta  = nullptr;
-    ggml_tensor * alpha = nullptr;
+    ggml_tensor * beta         = nullptr;
+    ggml_tensor * alpha_biased = nullptr;
     if (model.layers[il].ssm_beta_alpha_cat) {
         ggml_tensor * ba = build_lora_mm(model.layers[il].ssm_beta_alpha_cat, cur);
         cb(ba, "beta_alpha", il);
 
         beta  = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
                 ggml_element_size(ba), ba->nb[1], ba->nb[1] * n_seq_tokens, 0);
-        alpha = ggml_view_3d(ctx0, ba, num_v_heads, n_seq_tokens, n_seqs,
+        ggml_tensor * alpha = ggml_view_3d(ctx0, ba, num_v_heads, n_seq_tokens, n_seqs,
                 ba->nb[1], ba->nb[1] * n_seq_tokens, ggml_row_size(ba->type, num_v_heads));
+        cb(beta, "beta", il);
+        cb(alpha, "alpha", il);
+
+        beta = ggml_sigmoid(ctx0, beta);
+        cb(beta, "beta_sigmoid", il);
+
+        alpha_biased = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
     } else {
         beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+        cb(beta, "beta", il);
+
+        // reshape after the activation so that mul_mat + unary can be fused
+        beta = ggml_sigmoid(ctx0, beta);
+        cb(beta, "beta_sigmoid", il);
+
         beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
 
-        alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
-        alpha = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
-        alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+        ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+        cb(alpha, "alpha", il);
+
+        alpha_biased = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
     }
-    cb(beta, "beta", il);
-    cb(alpha, "alpha", il);
-
-    beta = ggml_sigmoid(ctx0, beta);
-    cb(beta, "beta_sigmoid", il);
-
-    // without the concatenated weight the bias follows the mul_mat directly (added before the reshape), so it can be fused
-    ggml_tensor * alpha_biased = model.layers[il].ssm_beta_alpha_cat ? ggml_add(ctx0, alpha, model.layers[il].ssm_dt) : alpha;
     ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
     cb(alpha_softplus, "a_softplus", il);
 

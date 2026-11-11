@@ -8227,6 +8227,51 @@ static std::string var_to_str(mul_mat_add_mode mode) {
     return "unknown";
 }
 
+// mul_mat followed by sigmoid, or by add + softplus + mul, as the gated delta net builds its gates
+struct test_mul_mat_gate : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool softplus;
+
+    test_mul_mat_gate(ggml_type type_a, int64_t m, int64_t n, int64_t k, bool softplus)
+        : type_a(type_a), m(m), n(n), k(k), softplus(softplus) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, m, n, k, softplus);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return softplus ? "MUL_MAT_SOFTPLUS_MUL" : "MUL_MAT_SIGMOID";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a   = ggml_new_tensor_2d(ctx, type_a,        k, m);
+        ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+
+        if (softplus) {
+            ggml_tensor * dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+            ggml_tensor * sa = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+            out = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, out, dt)), sa);
+        } else {
+            out = ggml_sigmoid(ctx, out);
+        }
+        out = ggml_reshape_4d(ctx, out, 1, m, n, 1);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // mul_mat followed by an add of a residual, which backends may fuse into the mat-mul
 struct test_mul_mat_add : public test_case {
     const ggml_type type_a;
@@ -12090,6 +12135,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
         for (int64_t n : {1, 4}) {
             test_cases.emplace_back(new test_mul_mat_add(type_a, 32, n, 2048, MUL_MAT_ADD_ROW));
+        }
+    }
+
+    // gated delta net gates: few rows, float weights (one token takes the fused path)
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int64_t n : {1, 4}) {
+            for (bool softplus : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_gate(type_a, 32, n, 2048, softplus));
+            }
         }
     }
 
