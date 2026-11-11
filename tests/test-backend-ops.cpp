@@ -11839,6 +11839,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Multi-column MMVQ for the other K-quant, Q4_0 and IQ weight types, n = 1..8.
+    for (ggml_type type_a : { GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS }) {
+        for (int n = 1; n <= 8; ++n) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 1024, { 1, 1 }, { 1, 1 }));
+        }
+        for (int n : {1, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1023, n, 4096, { 1, 1 }, { 1, 1 }));
+        }
+    }
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.
@@ -12226,6 +12236,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // per-expert base offset, which k == 256 alone leaves untested
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 1024, 1, 2048));
+
+    // 256 experts with 8 used at 1..8 tokens: wide and tall expert matrices
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS}) {
+        for (int n : {1, 2, 3, 4, 5, 8}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false,  64, n, 512));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 256, n, 256));
+        }
+    }
 
     // TODO: disabled until CUDA backend support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]
 #if 0
@@ -13018,6 +13036,36 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 4096,  24, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {8, 1}, 4096,  24, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false));
 
+    // Decode and speculative verify batches (1-8 tokens) with quantized KV in the llama.cpp cache layout,
+    // GQA 2-8 and head sizes 256/512. D=512 needs a kv size that is a multiple of 256 for the GQA kernels.
+    for (auto [type_K, type_V] : {std::pair{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, std::pair{GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}, std::pair{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
+        const bool full = type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0;
+        for (int64_t nr : {2, 4, 6, 8}) {
+            if (!full && (nr == 2 || nr == 6)) {
+                continue;
+            }
+            for (int64_t kv : {1025, 4096}) {
+                for (int64_t nb : {1, 2, 3, 4, 5, 8}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {nr, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V, {0, 2, 1, 3}, false));
+                }
+            }
+        }
+        for (int64_t nr : {4, 8}) {
+            if (!full && nr == 4) {
+                continue;
+            }
+            for (int64_t nb : {1, 2, 3, 4, 5, 8}) {
+                test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {nr, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V, {0, 2, 1, 3}, false));
+            }
+        }
+    }
+    // 16 KV heads with GQA 2 (sliding window layers)
+    for (ggml_type type_KV : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (int64_t nb : {1, 2, 4, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 16, {2, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, false));
+        }
+    }
+
     // Sparse mask hint: supported decode/prefill layouts and dense fallbacks.
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 2}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  768));
@@ -13704,6 +13752,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // multi-column mat-vec on the weight shapes of 9B to 31B dense models
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS}) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{4096, 4096}, {12288, 4096}, {4096, 12288}, {17408, 5120}, {21504, 5376}}) {
+            for (int n = 1; n <= 8; ++n) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
@@ -13720,6 +13777,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 1792, bs, 2048));
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 1792, bs, 2048, 1));
             }
+        }
+    }
+
+    // 8 of 32 quantized experts at 1-8 tokens (few experts keep the weight init short)
+    for (int bs = 1; bs <= 8; ++bs) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 8, false,  512, bs, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 8, false, 2048, bs,  512));
         }
     }
 
@@ -13821,6 +13886,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // decode and speculative verify batches (1-8 tokens) with the KV cache layout of GQA models
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (int64_t kv : {4096, 16384, 32768, 65536}) {
+            for (int64_t nb : {1, 2, 3, 4, 5, 8}) {
+                // hsk, KV heads, GQA ratio
+                for (auto [hs, nh, nr] : std::vector<std::array<int64_t, 3>>{{256, 4, 4}, {256, 4, 6}, {256, 2, 8}, {512, 4, 8}}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {nr, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, false));
+                }
+            }
+        }
+    }
+    // 16 KV heads with GQA 2, window sized KV
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (int64_t nb : {1, 2, 3, 4, 5, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 16, {2, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, false));
+        }
+    }
 
     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
         for (int hs : { 64, 128, 256, 512, 576, }) {
