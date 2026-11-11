@@ -65,6 +65,15 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 // if grammar_first is true, the grammar is applied before the samplers (slower)
 // useful in cases where all the resulting candidates (not just the sampled one) must fit the grammar
 //
+// The samplers that run before top-k (logit bias, penalties) lower the logits of a few tokens only. Each lowered token can let
+// one more token into the top-k, so the tokens that top-k keeps are among the top_k + n_changed largest logits,
+// together with the tokens whose logit is raised.
+// Returns that number of logits, 0 if the chain needs all the logits. n_suppress is the number of suppressed tokens of the vocabulary.
+size_t common_sampler_n_preselect(const common_params_sampling & params, size_t n_suppress);
+
+// Fills cur with the n largest logits and the tokens with a positive logit bias, in token order.
+void common_sampler_preselect(const float * logits, int32_t n_vocab, size_t n, const std::vector<llama_logit_bias> & logit_bias, std::vector<llama_token_data> & cur);
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
 // generalized version of common_sampler_sample
