@@ -753,11 +753,10 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :
     concurrent_stream_context(std::make_unique<ggml_cuda_stream_context>()) {
 }
 
-void ggml_backend_cuda_context::ggml_cuda_q8_1_cache::set(const ggml_tensor * src1) {
+void ggml_backend_cuda_context::ggml_cuda_q8_1_cache::set(const ggml_tensor * src1, const int64_t (& a)[8]) {
     data    = src1->data;
     src_end = (uintptr_t) src1->data + ggml_backend_buft_get_alloc_size(src1->buffer->buft, src1);
-    memcpy(ne, src1->ne, sizeof(ne));
-    memcpy(nb, src1->nb, sizeof(nb));
+    memcpy(args, a, sizeof(args));
 }
 
 void ggml_backend_cuda_context::ggml_cuda_q8_1_cache::invalidate_if_written(const ggml_tensor * node) {
