@@ -206,3 +206,56 @@ bool ggml_cuda_get_tensor_n(int device,
     return true;
 #endif
 }
+
+bool ggml_cuda_set_tensor_n(int device,
+        struct ggml_tensor * const * tensors, const void * const * data, const size_t * offsets,
+        const size_t * sizes, size_t n_tensors) {
+#if defined(GGML_USE_HIP)
+    // On ROCm every copy from pageable memory maps its source for the transfer, which costs more than the copy for many
+    // small writes from one buffer, e.g. a recurrent state. The span of the sources is registered once for the batch.
+    constexpr size_t min_payload_bytes = 1024 * 1024;
+    GGML_UNUSED(device);
+
+    uintptr_t begin = UINTPTR_MAX;
+    uintptr_t end   = 0;
+    size_t payload_bytes = 0;
+    size_t n_writes = 0;
+    for (size_t i = 0; i < n_tensors; ++i) {
+        if (sizes[i] == 0) {
+            continue;
+        }
+        const uintptr_t address = (uintptr_t) data[i];
+        GGML_ASSERT(address <= UINTPTR_MAX - sizes[i]);
+        begin = std::min(begin, address);
+        end   = std::max(end, address + sizes[i]);
+        payload_bytes += sizes[i];
+        n_writes++;
+    }
+    // the sources may overlap, so the payload can exceed the span
+    if (n_writes < 2 || payload_bytes < min_payload_bytes || end - begin > 2*payload_bytes) {
+        return false;
+    }
+
+    // the registration is released when the mapping goes out of scope, after the stream is synchronized
+    ggml_cuda_batch_get_mapping mapping((void *) begin, end - begin);
+    if (!mapping.host) {
+        return false;
+    }
+
+    for (size_t i = 0; i < n_tensors; ++i) {
+        if (sizes[i]) {
+            CUDA_CHECK(cudaMemcpyAsync((char *) tensors[i]->data + offsets[i], data[i], sizes[i], cudaMemcpyHostToDevice, cudaStreamPerThread));
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    return true;
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(tensors);
+    GGML_UNUSED(data);
+    GGML_UNUSED(offsets);
+    GGML_UNUSED(sizes);
+    GGML_UNUSED(n_tensors);
+    return false;
+#endif
+}
