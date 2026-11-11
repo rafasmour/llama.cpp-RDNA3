@@ -4545,6 +4545,61 @@ struct test_add_unary_mul : public test_case {
     }
 };
 
+// GGML_OP_UNARY(SIGMOID) + MUL + ADD + ADD with the sigmoid gate broadcast over dim 0:
+// the shared expert tail of the MoE FFN, moe_out + shexp * sigmoid(gate) + residual.
+struct test_shared_expert_tail : public test_case {
+    const std::array<int64_t, 2> ne; // [n_embd, n_tokens]
+    const std::string tail;          // extra consumer of an intermediate, see build_graph()
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SHARED_EXPERT_TAIL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, tail);
+    }
+
+    test_shared_expert_tail(std::array<int64_t, 2> ne = {2048, 1}, std::string tail = "")
+        : ne(ne), tail(std::move(tail)) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * logit = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, ne[1]);
+        ggml_set_name(logit, "logit");
+        ggml_tensor * shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_set_name(shexp, "shexp");
+        ggml_tensor * moe = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_set_name(moe, "moe");
+        ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_set_name(res, "res");
+
+        ggml_tensor * gate  = ggml_sigmoid(ctx, logit);
+        ggml_tensor * gated = ggml_mul(ctx, shexp, gate);
+        ggml_tensor * sum   = tail == "swapped" ? ggml_add(ctx, gated, moe) : ggml_add(ctx, moe, gated);
+        ggml_tensor * out   = tail == "swapped" ? ggml_add(ctx, res, sum)   : ggml_add(ctx, sum, res);
+
+        if (tail == "swapped") {
+            // operand order of the adds does not matter
+        } else if (tail == "mul_in_last_add") {
+            // the first add does not take the gated output, so the chain must not fuse
+            out = ggml_add(ctx, ggml_add(ctx, moe, res), gated);
+        } else if (tail == "reuse_gate") {
+            // a second read of the sigmoid result must block the fusion
+            out = ggml_add(ctx, out, ggml_mul(ctx, moe, gate));
+        } else if (tail == "reuse_sum") {
+            // a second read of the first sum must block the fusion
+            out = ggml_add(ctx, out, sum);
+        } else if (!tail.empty()) {
+            GGML_ABORT("unknown tail %s", tail.c_str());
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -10619,6 +10674,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // a unary op with no fused kernel must fall back to the three-op chain
     test_cases.emplace_back(new test_add_unary_mul(GGML_UNARY_OP_GELU, GGML_TYPE_F32, { 32, 7, 1, 1 }));
+
+    // fused sigmoid gate + mul + add + add: shared expert tail of the MoE FFN
+    for (std::array<int64_t, 2> ne : { std::array<int64_t, 2>{ 2048, 1 }, { 2048, 7 }, { 33, 5 } }) {
+        test_cases.emplace_back(new test_shared_expert_tail(ne));
+    }
+    test_cases.emplace_back(new test_shared_expert_tail({ 2048, 1 }, "reuse_gate"));
+    test_cases.emplace_back(new test_shared_expert_tail({ 2048, 7 }, "reuse_sum"));
+    test_cases.emplace_back(new test_shared_expert_tail({ 2048, 7 }, "swapped"));
+    test_cases.emplace_back(new test_shared_expert_tail({ 2048, 7 }, "mul_in_last_add"));
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
