@@ -1474,6 +1474,8 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
+    ggml_unary_op unary_op = GGML_UNARY_OP_COUNT; // activation applied after the bias, MUL_MAT only
+    const ggml_tensor * unary_mul = nullptr;      // per-row factor applied after the activation
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1487,6 +1489,8 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    ggml_unary_op unary_op = GGML_UNARY_OP_COUNT;
+    const void * unary_mul = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {
