@@ -761,6 +761,45 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
+/* fused sigmoid-gated shared expert tail: dst = moe + shexp * sigmoid(gate) + residual */
+
+static __global__ void sigmoid_gate_add_kernel(
+        const float * gate, const float * shexp, const float * moe, const float * res, float * dst,
+        const int64_t k, const int64_t nc, const int64_t gate_stride, const int64_t shexp_stride,
+        const int64_t moe_stride, const int64_t res_stride) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t row = i / nc;
+    const int64_t col = i % nc;
+
+    ggml_cuda_pdl_sync();
+    const float gated = shexp[row*shexp_stride + col] * op_sigmoid(gate[row*gate_stride]);
+    dst[i] = moe[row*moe_stride + col] + gated + res[row*res_stride + col];
+}
+
+void ggml_cuda_op_sigmoid_gate_add(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * shexp,
+        const ggml_tensor * moe, const ggml_tensor * res, ggml_tensor * dst) {
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && shexp->type == GGML_TYPE_F32 && moe->type == GGML_TYPE_F32 &&
+                res->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int64_t k  = ggml_nelements(dst);
+    const int64_t nc = dst->ne[0];
+
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(sigmoid_gate_add_kernel, launch_params,
+        (const float *) gate->data, (const float *) shexp->data, (const float *) moe->data,
+        (const float *) res->data, (float *) dst->data, k, nc,
+        (int64_t) (gate->nb[1] / sizeof(float)), (int64_t) (shexp->nb[1] / sizeof(float)),
+        (int64_t) (moe->nb[1] / sizeof(float)), (int64_t) (res->nb[1] / sizeof(float)));
+}
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {
