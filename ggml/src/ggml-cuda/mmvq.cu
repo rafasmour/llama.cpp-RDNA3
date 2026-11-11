@@ -1559,23 +1559,26 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    // Mat-vecs with the same src1 share one quantization, only on the main stream. The pool buffer is held until src1 changes or the evaluation ends.
-    const bool use_cache = !ids && ctx.curr_stream_no == 0;
+    // Share one q8_1 quantization between mat-vecs with the same src1 data and launch arguments (main stream only).
+    // A MUL_MAT_ID with one src1 row per expert is not shared, so it must not evict the entry.
+    const int64_t s11_q = src1->nb[1] / ts_src1;
+    const int64_t s12_q = src1->nb[2] / ts_src1;
+    const int64_t s13_q = src1->nb[3] / ts_src1;
+    const int64_t q_args[8] = { ne10, s11_q, s12_q, s13_q, ne10_padded, ne11, ne12, ne13 };
+
+    const bool use_cache = ctx.curr_stream_no == 0 && (!ids || ne11 == 1);
     std::unique_ptr<ggml_cuda_pool_alloc<char>> src1_q8_1_local;
     std::unique_ptr<ggml_cuda_pool_alloc<char>> & src1_q8_1 = use_cache ? ctx.q8_1_cache.buf : src1_q8_1_local;
-    if (!use_cache || !ctx.q8_1_cache.matches(src1)) {
+    if (!use_cache || !ctx.q8_1_cache.matches(src1, q_args)) {
         if (use_cache) {
             ctx.q8_1_cache.clear();
         }
         src1_q8_1 = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
 
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, src1_q8_1->get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, src1_q8_1->get(), ne10, s11_q, s12_q, s13_q, ne10_padded, ne11, ne12, ne13, stream);
 
         if (use_cache) {
-            ctx.q8_1_cache.set(src1);
+            ctx.q8_1_cache.set(src1, q_args);
         }
     }
 

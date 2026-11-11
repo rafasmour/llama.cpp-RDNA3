@@ -6206,6 +6206,38 @@ struct test_mul_mat_id_shared : public test_case {
     }
 };
 
+// MUL_MAT_ID and MUL_MAT reading the same input through tensors of different shape, without the shared expert fusion
+struct test_mul_mat_id_shared_input : public test_case {
+    const ggml_type type;
+    const int64_t n;
+
+    test_mul_mat_id_shared_input(ggml_type type, int64_t n) : type(type), n(n) {}
+
+    std::string vars() override { return VARS_TO_STR2(type, n); }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_SHARED_INPUT"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, n);
+        ggml_tensor * input_ids = ggml_reshape_3d(ctx, input, 512, 1, n);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, n);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * experts = ggml_new_tensor_3d(ctx, type, 512, 256, 8);
+        ggml_tensor * shared_w = ggml_new_tensor_2d(ctx, type, 512, 128);
+        ggml_tensor * experts_down = ggml_new_tensor_3d(ctx, type, 256, 128, 8);
+        ggml_tensor * routed = ggml_mul_mat_id(ctx, experts, input_ids, ids);
+        // the down projection with another src1 sits between the two reads of the input, as in a MoE layer
+        routed = ggml_mul_mat_id(ctx, experts_down, routed, ids);
+        ggml_tensor * shared = ggml_mul_mat(ctx, shared_w, input);
+        return ggml_add(ctx, routed, ggml_reshape_3d(ctx, shared, 128, 1, n));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, 8);
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -12366,6 +12398,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
         for (int64_t n : { 1, 2, 3, 4, 8, 9 }) {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
+            test_cases.emplace_back(new test_mul_mat_id_shared_input(type, n));
         }
     }
 

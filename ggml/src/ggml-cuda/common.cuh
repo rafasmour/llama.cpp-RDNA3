@@ -1440,20 +1440,18 @@ struct ggml_backend_cuda_context {
         return pool(device);
     }
 
-    // q8_1 copy of the last quantized mat-vec src1, shared by following mat-vecs with the same src1
+    // q8_1 copy of the last quantized mat-vec src1, shared by following mat-vecs with the same src1 data and launch arguments
     struct ggml_cuda_q8_1_cache {
         std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
         const void * data = nullptr;
-        int64_t      ne[GGML_MAX_DIMS] = {};
-        size_t       nb[GGML_MAX_DIMS] = {};
+        int64_t      args[8] = {}; // ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13 of quantize_row_q8_1_cuda
         uintptr_t    src_end = 0; // the source memory range is [data, src_end)
 
-        bool matches(const ggml_tensor * src1) const {
-            return buf && data == src1->data &&
-                memcmp(ne, src1->ne, sizeof(ne)) == 0 && memcmp(nb, src1->nb, sizeof(nb)) == 0;
+        bool matches(const ggml_tensor * src1, const int64_t (& a)[8]) const {
+            return buf && data == src1->data && memcmp(args, a, sizeof(args)) == 0;
         }
 
-        void set(const ggml_tensor * src1);
+        void set(const ggml_tensor * src1, const int64_t (& a)[8]);
         // drop the cache if it reads memory that the node writes
         void invalidate_if_written(const ggml_tensor * node);
 
