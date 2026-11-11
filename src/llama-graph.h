@@ -314,6 +314,9 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // the states of the ubatch cells are read in place, the graph is only valid while this holds
+    bool s_copy_identity;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -1471,6 +1474,13 @@ struct llm_graph_context {
                 int32_t   state_size,
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
+
+    // like build_rs, but returns a view of the cache when s_copy is an identity (the new states must be written after all reads)
+    ggml_tensor * build_rs_in_place(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
 
     // store the conv history of the ubatch cells, the last n_cols columns of conv_x {n_cols + n_seq_tokens, channels, n_seqs},
     // at byte offset offs of each row of s, and with n_rs_seq > 0 once per rollback slot of this ubatch
