@@ -5313,6 +5313,90 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// GGML_OP_GATED_DELTA_NET reading its state from the recurrent cache and writing the new state to the same cells
+struct test_gated_delta_net_state_in_place : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int64_t head; // first cell of the ubatch
+
+    ggml_tensor * cpy_node = nullptr;
+    ggml_tensor * out_node = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR5(head_count, head_size, n_seq_tokens, n_seqs, head);
+    }
+
+    test_gated_delta_net_state_in_place(int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 1,
+            int64_t n_seqs = 1, int64_t head = 0)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), head(head) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S_v = head_size;
+        const int64_t H   = head_count;
+        const int64_t D   = S_v * S_v * H;
+
+        ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, n_seq_tokens, n_seqs);
+        ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, n_seq_tokens, n_seqs);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, n_seq_tokens, n_seqs);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_seq_tokens, n_seqs);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_seq_tokens, n_seqs);
+        ggml_set_name(g,    "g");
+        ggml_set_name(beta, "beta");
+        ggml_set_name(v,    "v");
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        // cache cells: head before the ubatch, and one after it
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, head + n_seqs + 1);
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * cells = ggml_view_2d(ctx, cache, D, n_seqs, cache->nb[1], head*cache->nb[1]);
+        ggml_tensor * state = ggml_reshape_4d(ctx, cells, S_v, S_v, H, n_seqs);
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+
+        ggml_tensor * new_state = ggml_view_2d(ctx, gdn_out, D, n_seqs, ggml_row_size(gdn_out->type, D),
+                ggml_row_size(gdn_out->type, S_v * H * n_seq_tokens * n_seqs));
+
+        ggml_tensor * cpy = ggml_cpy(ctx, new_state, cells);
+        ggml_set_name(cpy, "gdn_state_cpy");
+        cpy_node = cpy;
+
+        ggml_tensor * attn = ggml_view_1d(ctx, gdn_out, S_v * H * n_seq_tokens * n_seqs, 0);
+
+        // read the cpy output and the attention scores, so that neither the gdn nor the cpy is the graph output
+        ggml_tensor * out = ggml_add(ctx, ggml_sum(ctx, cpy), ggml_sum(ctx, attn));
+        out_node = out;
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_STATE_IN_PLACE";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node, out_node }; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -13480,6 +13564,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128,  4, 1, 1, false, false, /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, true,  /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32,   4, 2, 2, false, true,  /*K=*/4));
+
+    // gdn reading its state in place from the cache (K = 1)
+    test_cases.emplace_back(new test_gated_delta_net_state_in_place(4, 32, 1, 1, 0));
+    test_cases.emplace_back(new test_gated_delta_net_state_in_place(4, 64, 1, 2, 1));
+    test_cases.emplace_back(new test_gated_delta_net_state_in_place(8, 32, 4, 2, 2));
 
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
