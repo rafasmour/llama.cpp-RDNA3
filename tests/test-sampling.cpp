@@ -168,11 +168,16 @@ static void test_typical(const std::vector<float> & probs, const std::vector<flo
 
 static void test_penalties(
     const std::vector<float> & probs, const std::vector<llama_token> & last_tokens,
-    const std::vector<float> & probs_expected, float repeat_penalty, float alpha_frequency, float alpha_presence
+    const std::vector<float> & probs_expected, float repeat_penalty, float alpha_frequency, float alpha_presence, bool sort_first = false
 ) {
     GGML_ASSERT(probs.size() == probs_expected.size());
 
     sampler_tester tester(probs, probs_expected);
+
+    if (sort_first) {
+        // the candidates are no longer in token order
+        tester.apply(llama_sampler_init_top_k((int32_t) probs.size()));
+    }
 
     auto * sampler = llama_sampler_init_penalties((int32_t) probs.size(), (int32_t) last_tokens.size(), repeat_penalty, alpha_frequency, alpha_presence);
 
@@ -384,6 +389,7 @@ int main(void) {
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0},             {0.000011f, 0.249997f, 0.249997f, 0.249997f, 0.249997f}, 1.0f, 5.0f, 5.0f);
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2},       {0.000023f, 0.000023f, 0.000023f, 0.499966f, 0.499966f}, 1.0f, 5.0f, 5.0f);
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, {0.000000f, 0.000023f, 0.000023f, 0.499977f, 0.499977f}, 1.0f, 5.0f, 5.0f);
+    test_penalties({0.1f, 0.2f, 0.3f, 0.4f}, {3}, {0.0f, 0.5f, 0.333333f, 0.166667f}, 50.0f, 0.0f, 0.0f, true);
 
 
     test_dry({0.25f, 0.25f, 0.25f, 0.25f}, {0, 1}, {0.25f, 0.25f, 0.25f, 0.25f}, 1.0f, 1.1f, 2, 4, {});
