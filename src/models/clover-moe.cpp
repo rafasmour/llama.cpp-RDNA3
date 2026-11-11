@@ -344,30 +344,15 @@ ggml_tensor * llama_model_clover_moe::graph::build_layer_attn_linear(
     int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
     int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, qkv_dim);
 
-    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            0);
-
-    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
-
     ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
             ggml_row_size(conv_qkv_mix->type, head_v_dim),
             nb1_qkv,
             nb1_qkv * n_seq_tokens,
             ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
 
-    cb(q_conv, "q_conv", il);
-    cb(k_conv, "k_conv", il);
     cb(v_conv, "v_conv", il);
 
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, 1e-6f);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, 1e-6f);
+    auto [q_conv, k_conv] = build_gdn_l2_norm_qk(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs, 1e-6f);
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
