@@ -460,15 +460,18 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
+        // the cells of the sequence are found through its ordered positions, a scan of all cells is not needed
+        // the cells are collected first because seq_rm changes the positions of the sequence
+        const auto & seq_pos = cells.seq_pos_get(seq_id);
 
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
-                }
+        std::vector<uint32_t> idxs;
+        for (auto it = seq_pos.lower_bound({ p0, 0 }); it != seq_pos.end() && it->first < p1; ++it) {
+            idxs.push_back(it->second);
+        }
+
+        for (const uint32_t i : idxs) {
+            if (cells.seq_rm(i, seq_id)) {
+                new_head = std::min(new_head, i);
             }
         }
 
