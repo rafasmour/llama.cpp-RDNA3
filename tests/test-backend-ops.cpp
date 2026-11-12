@@ -11889,6 +11889,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_rms_norm_mul_rope({n, 4, 3, 1}, 1e-6f, false, true, true, mode, true, true, set_rows_type));
             }
         }
+        // multi-section rope (Qwen3.5 family: q/k norm of an attention layer), with and without the write into the cache
+        for (int mode : {GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE}) {
+            for (int64_t n_tokens : {1, 5}) {
+                for (bool set_rows : {false, true}) {
+                    for (bool yarn : {false, true}) {
+                        test_cases.emplace_back(new test_rms_norm_mul_rope({256, 4, n_tokens, 1}, 1e-6f, false, set_rows, true, mode, true, true, set_rows_type, yarn));
+                        test_cases.emplace_back(new test_rms_norm_mul_rope({1026, 2, n_tokens, 1}, 1e-6f, false, set_rows, true, mode, true, true, set_rows_type, yarn));
+                    }
+                }
+            }
+        }
     }
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 1.0f }) {
