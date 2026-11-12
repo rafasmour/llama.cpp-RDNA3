@@ -1850,7 +1850,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
             if (ss == nullptr) {
                 sched_small.push_back({ key, ggml_backend_sched_ptr(ggml_backend_sched_new(
-                        backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), graph_max_nodes(n_tokens_per_size), false, cparams.op_offload)), nullptr });
+                        backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), graph_max_nodes(), false, cparams.op_offload)), nullptr });
                 ss = &sched_small.back();
                 ggml_backend_sched_set_copy_callback(ss->sched.get(), sched_copy_experts, this);
                 ggml_backend_sched_set_realloc_callback(ss->sched.get(), sched_graph_realloc, this);
