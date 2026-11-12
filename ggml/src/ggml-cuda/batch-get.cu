@@ -4,13 +4,14 @@
 
 #include <climits>
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
 struct ggml_cuda_batch_get_descriptor {
     const unsigned char * src;
     unsigned char * dst;
     size_t size;
 };
 
+#if !defined(GGML_USE_HIP)
 static __global__ void ggml_cuda_batch_get_kernel(const ggml_cuda_batch_get_descriptor * copies, size_t count) {
     // Blocks along y cooperate on each descriptor.
     const size_t index = blockIdx.x;
@@ -49,6 +50,7 @@ static __global__ void ggml_cuda_batch_get_kernel(const ggml_cuda_batch_get_desc
         ggml_cuda_memcpy_1<1>(copy.dst + i, copy.src + i);
     }
 }
+#endif // !defined(GGML_USE_HIP)
 
 struct ggml_cuda_batch_get_mapping {
     void * host = nullptr;
@@ -63,11 +65,13 @@ struct ggml_cuda_batch_get_mapping {
             return;
         }
         this->host = host;
+#if !defined(GGML_USE_HIP)
         if (cudaHostGetDevicePointer((void **) &device, host, 0) != cudaSuccess) {
             (void) cudaGetLastError();
             device = nullptr;
             return;
         }
+#endif // !defined(GGML_USE_HIP)
     }
 
     ggml_cuda_batch_get_mapping(const ggml_cuda_batch_get_mapping &) = delete;
@@ -85,7 +89,7 @@ struct ggml_cuda_batch_get_mapping {
 bool ggml_cuda_get_tensor_n(int device,
         const ggml_tensor * const * tensors, void * const * data, const size_t * offsets,
         const size_t * sizes, size_t n_tensors) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#if defined(GGML_USE_MUSA)
     GGML_UNUSED(device);
     GGML_UNUSED(tensors);
     GGML_UNUSED(data);
@@ -143,6 +147,11 @@ bool ggml_cuda_get_tensor_n(int device,
     if (!mapping.host) {
         return false;
     }
+#if defined(GGML_USE_HIP)
+    // On HIP the reads use DMA only. Without the registration every copy to pageable memory maps its destination for the transfer.
+    GGML_UNUSED(device);
+    const size_t n_reads_gather = 0;
+#else
     // Reads selected for gather; zero means all reads use DMA.
     size_t n_reads_gather = mapping.device && n_reads_small >= min_batch_reads ? n_reads_small : 0;
     // Keep descriptor storage alive until the final stream synchronization.
@@ -185,6 +194,7 @@ bool ggml_cuda_get_tensor_n(int device,
             }
         }
     }
+#endif // defined(GGML_USE_HIP)
     // Keep the destination pinned for DMA too; overlapping destinations already declined above.
     for (size_t i = 0; i < n_tensors; ++i) {
         if (sizes[i] && (!n_reads_gather || sizes[i] > max_gather_read_bytes)) {
