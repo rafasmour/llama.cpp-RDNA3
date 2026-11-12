@@ -37,6 +37,16 @@ using namespace cub;
 #    endif  // CCCL >= 3.4.3
 #endif      // GGML_CUDA_USE_CUB
 
+// up to this k, long rows are selected by k rounds of a block maximum instead of the radix passes, 0 disables
+#ifndef GGML_CUDA_TOP_K_SELECT_MAX_K
+#    if defined(GGML_USE_HIP)
+#        define GGML_CUDA_TOP_K_SELECT_MAX_K 32
+#    else
+// not measured on CUDA/MUSA
+#        define GGML_CUDA_TOP_K_SELECT_MAX_K 0
+#    endif
+#endif // GGML_CUDA_TOP_K_SELECT_MAX_K
+
 // max rows for the per-row DeviceTopK / CUB argsort path before switching to radix / bitonic
 #ifndef GGML_CUDA_TOP_K_NROWS_THRESHOLD
 #    ifdef CUB_TOP_K_AVAILABLE
@@ -299,6 +309,143 @@ static void top_k_radix_cuda(
     }
 }
 
+// Selection for small k: the elements are ordered by (value, lower column first) like the radix select orders them,
+// packed into one 64-bit key. Each round takes the largest key below the one of the previous round.
+
+static __device__ __forceinline__ uint64_t top_k_select_key(const float value, const int64_t col) {
+    return ((uint64_t) top_k_float_to_ordered(value) << 32) | (uint32_t) ~(uint32_t) col;
+}
+
+// maximum over the block, the same in all threads. shared: one slot per warp
+template<int BLOCK_SIZE>
+static __device__ __forceinline__ uint64_t top_k_select_block_max(uint64_t x, uint64_t * shared) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = BLOCK_SIZE / warp_size;
+#pragma unroll
+    for (int offset = warp_size/2; offset > 0; offset >>= 1) {
+        const uint32_t lo = __shfl_xor_sync(0xffffffff, (uint32_t) x, offset, warp_size);
+        const uint32_t hi = __shfl_xor_sync(0xffffffff, (uint32_t) (x >> 32), offset, warp_size);
+        const uint64_t y  = ((uint64_t) hi << 32) | lo;
+        x = y > x ? y : x;
+    }
+    if (threadIdx.x % warp_size == 0) {
+        shared[threadIdx.x / warp_size] = x;
+    }
+    __syncthreads();
+    uint64_t res = 0;
+#pragma unroll
+    for (int w = 0; w < nwarps; ++w) {
+        const uint64_t y = shared[w];
+        res = y > res ? y : res;
+    }
+    __syncthreads();
+    return res;
+}
+
+// the k largest keys of each block of a row, 0 where the block has fewer elements
+template<int BLOCK_SIZE>
+static __global__ void top_k_select_block(
+        const float * __restrict__ src,
+        uint64_t * __restrict__ block_keys,
+        int ncols,
+        int block_cols,
+        int blocks_per_row,
+        int k) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    __shared__ uint64_t shared[BLOCK_SIZE / warp_size];
+
+    const int row       = blockIdx.x / blocks_per_row;
+    const int row_block = blockIdx.x % blocks_per_row;
+    const float * row_src = src + (size_t) row * ncols;
+    const int64_t col_begin = (int64_t) row_block * block_cols;
+    const int64_t col_end   = min(col_begin + block_cols, (int64_t) ncols);
+    uint64_t * keys = block_keys + (size_t) blockIdx.x * k;
+
+    uint64_t prev = ~(uint64_t) 0;
+    for (int r = 0; r < k; ++r) {
+        uint64_t best = 0;
+        for (int64_t col = col_begin + threadIdx.x; col < col_end; col += BLOCK_SIZE) {
+            const uint64_t key = top_k_select_key(row_src[col], col);
+            if (key < prev && key > best) {
+                best = key;
+            }
+        }
+        best = top_k_select_block_max<BLOCK_SIZE>(best, shared);
+        if (threadIdx.x == 0) {
+            keys[r] = best;
+        }
+        prev = best;
+    }
+}
+
+// the k largest of the block keys of a row, written as columns in descending order
+template<int BLOCK_SIZE>
+static __global__ void top_k_select_merge(
+        const uint64_t * __restrict__ block_keys,
+        int * __restrict__ dst,
+        int blocks_per_row,
+        int k) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    __shared__ uint64_t shared[BLOCK_SIZE / warp_size];
+
+    const int row = blockIdx.x;
+    const uint64_t * keys = block_keys + (size_t) row * blocks_per_row * k;
+    const int nkeys = blocks_per_row * k;
+
+    uint64_t prev = ~(uint64_t) 0;
+    for (int r = 0; r < k; ++r) {
+        uint64_t best = 0;
+        for (int i = threadIdx.x; i < nkeys; i += BLOCK_SIZE) {
+            const uint64_t key = keys[i];
+            if (key < prev && key > best) {
+                best = key;
+            }
+        }
+        best = top_k_select_block_max<BLOCK_SIZE>(best, shared);
+        if (threadIdx.x == 0) {
+            dst[(size_t) row * k + r] = (int) ~(uint32_t) best;
+        }
+        prev = best;
+    }
+}
+
+static void top_k_select_cuda(
+        ggml_cuda_pool & pool,
+        const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
+    constexpr int BLOCK_SIZE = 256;
+    const int blocks_per_row = (int) std::min<int64_t>(((int64_t) ncols + 1023) / 1024, 64);
+    // each block of a row reads a contiguous range of columns
+    const int block_cols = (int) (((int64_t) ncols + blocks_per_row - 1) / blocks_per_row);
+
+    // chunk the rows to bound the key memory to 64 MB
+    const int64_t chunk_nrows = ggml_cuda_chunk_nrows((size_t) blocks_per_row * k * sizeof(uint64_t), nrows);
+
+    ggml_cuda_pool_alloc<uint64_t> keys_alloc(pool, (size_t) chunk_nrows * blocks_per_row * k);
+    uint64_t * keys = keys_alloc.get();
+
+    for (int64_t i = 0; i < nrows; i += chunk_nrows) {
+        const int iter_nrows = std::min(chunk_nrows, nrows - i);
+
+        top_k_select_block<BLOCK_SIZE><<<blocks_per_row * iter_nrows, BLOCK_SIZE, 0, stream>>>(
+            src, keys, ncols, block_cols, blocks_per_row, k);
+        top_k_select_merge<BLOCK_SIZE><<<iter_nrows, BLOCK_SIZE, 0, stream>>>(keys, dst, blocks_per_row, k);
+
+        src += (size_t) ncols * iter_nrows;
+        dst += (size_t) k     * iter_nrows;
+    }
+}
+
+// long rows without a sort: by selection for small k, else by radix passes
+static void top_k_long_rows_cuda(
+        ggml_cuda_pool & pool,
+        const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
+    if (k <= GGML_CUDA_TOP_K_SELECT_MAX_K) {
+        top_k_select_cuda(pool, src, dst, ncols, nrows, k, stream);
+    } else {
+        top_k_radix_cuda(pool, src, dst, ncols, nrows, k, stream);
+    }
+}
+
 static void top_k_argsort_cuda(
         ggml_cuda_pool & pool,
         const float * src, int * dst, int ncols, int64_t nrows, int k, bool use_cub, cudaStream_t stream) {
@@ -365,7 +512,7 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 
     if (nrows > GGML_CUDA_TOP_K_NROWS_THRESHOLD) {
-        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        top_k_long_rows_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }
 
@@ -378,9 +525,9 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_ARGSORT) {
         top_k_argsort_cuda(pool, src0_d, dst_d, ncols, nrows, k, true, stream);
     } else {
-        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        top_k_long_rows_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
     }
 #else                             // GGML_CUDA_USE_CUB
-    top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+    top_k_long_rows_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
 #endif                            // CUB_TOP_K_AVAILABLE
 }
