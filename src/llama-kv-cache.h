@@ -35,7 +35,7 @@ public:
         // data for ggml_set_rows
         using idx_vec_t = std::vector<uint32_t>;
 
-        // number of streams: ns = s1 - s0 + 1
+        // the streams s0, s0 + stream_step(), ..., s1
         uint32_t s0;
         uint32_t s1;
 
@@ -63,6 +63,24 @@ public:
 
         size_t n_stream() const {
             return strm.size();
+        }
+
+        // the distance between the streams, 0 if they are not evenly spaced in increasing order
+        // K and V of a ubatch are a view of the cache with this step between the streams
+        uint32_t stream_step() const {
+            if (strm.size() < 2) {
+                return 1;
+            }
+            if (strm[1] <= strm[0]) {
+                return 0;
+            }
+            const uint32_t step = strm[1] - strm[0];
+            for (size_t s = 2; s < strm.size(); ++s) {
+                if (strm[s] != strm[s - 1] + (llama_seq_id) step) {
+                    return 0;
+                }
+            }
+            return step;
         }
 
         bool empty() const {
@@ -160,6 +178,9 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
+
+    // whether the sequences of a ubatch may be evenly spaced instead of consecutive, see slot_info::stream_step()
+    bool get_can_step_streams() const;
 
     bool get_has_shift() const;
 
