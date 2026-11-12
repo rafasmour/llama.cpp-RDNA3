@@ -1242,40 +1242,64 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+        // an M-RoPE image pins all its rows to one position, so a windowed draft
+        // cache cannot free cells for it - skip it, the draft can jump over the gap
+        const auto skip_seq = [&](const llama_seq_id seq_id) {
             if (i_batch_beg[seq_id] < 0) {
+                return true;
+            }
+            const int32_t n_rows     = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            const bool    pos_pinned = batch_in.tokens[i_batch_beg[seq_id]].pos[0] == batch_in.tokens[i_batch_end[seq_id]].pos[0];
+            return has_embeddings && n_rows > 1 && pos_pinned;
+        };
+
+        if (use_dev_features) {
+            // the features are the target batch rows in the target's device buffer.
+            // the rows of all sequences go into the same draft decodes: with several slots generating this is one
+            // pass over the draft model per target step instead of one per slot
+            int32_t n_inject = 0;
+            batch_inject.clear();
+
+            const auto flush = [&]() {
+                if (n_inject == 0) {
+                    return true;
+                }
+                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                if (rc != 0) {
+                    LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d)\n", __func__, rc, (int) n_inject);
+                    return false;
+                }
+                n_inject = 0;
+                batch_inject.clear();
+                return true;
+            };
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (skip_seq(seq_id)) {
+                    continue;
+                }
+                for (int32_t row = i_batch_beg[seq_id]; row <= i_batch_end[seq_id]; ++row) {
+                    if (n_inject == n_ubatch && !flush()) {
+                        return false;
+                    }
+                    const llama_pos p          = batch_in.tokens[row].pos[0];
+                    const llama_pos pos_arr[4] = { p, p, p, 0 };
+                    batch_inject.add_embd_row(row, pos_arr, seq_id, false);
+                    n_inject++;
+                }
+            }
+
+            return flush();
+        }
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (skip_seq(seq_id)) {
                 continue;
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
-            // an M-RoPE image pins all its rows to one position, so a windowed draft
-            // cache cannot free cells for it - skip it, the draft can jump over the gap
-            const bool pos_pinned = batch_in.tokens[i_batch_beg[seq_id]].pos[0] == batch_in.tokens[i_batch_end[seq_id]].pos[0];
-            if (has_embeddings && n_rows > 1 && pos_pinned) {
-                continue;
-            }
-
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
-
-                if (use_dev_features) {
-                    // the features are the target batch rows in the target's device buffer
-                    batch_inject.clear();
-                    for (int32_t i = 0; i < n_chunk; ++i) {
-                        const int32_t   row        = i_batch_beg[seq_id] + offset + i;
-                        const llama_pos p          = batch_in.tokens[row].pos[0];
-                        const llama_pos pos_arr[4] = { p, p, p, 0 };
-                        batch_inject.add_embd_row(row, pos_arr, seq_id, false);
-                    }
-
-                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
-                    if (rc != 0) {
-                        LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                                __func__, rc, (int) n_chunk, (int) offset);
-                        return false;
-                    }
-                    continue;
-                }
 
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
