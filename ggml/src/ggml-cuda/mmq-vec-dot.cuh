@@ -40,7 +40,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
                 int tmp0[4], tmp1[4];
 
-                #pragma unroll
+#pragma unroll
                 for (int l0 = 0; l0 < 4 / mcpy_int; ++l0) {
                     ggml_cuda_memcpy_1<max_cpy>(tmp0 + l0 * mcpy_int, &y_qs[j*MMQ_TILE_Y_K + kyqs + l0 * mcpy_int]  );
                     ggml_cuda_memcpy_1<max_cpy>(tmp1 + l0 * mcpy_int, &y_qs[j*MMQ_TILE_Y_K + kyqs + QI4_0 + l0 * mcpy_int]);
@@ -90,7 +90,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
                 int tmp0[4], tmp1[4];
 
-                #pragma unroll
+#pragma unroll
                 for (int l0 = 0; l0 < 4 / mcpy_int; ++l0) {
                     ggml_cuda_memcpy_1<max_cpy>(tmp0 + l0 * mcpy_int, &y_qs[j*MMQ_TILE_Y_K + kyqs + l0 * mcpy_int]  );
                     ggml_cuda_memcpy_1<max_cpy>(tmp1 + l0 * mcpy_int, &y_qs[j*MMQ_TILE_Y_K + kyqs + QI4_1 + l0 * mcpy_int]);
@@ -162,38 +162,87 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
-    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
-        const int k0 = k00 + k01;
+#if defined(RDNA3)
+    // On RDNA3 the fully unrolled k01 loop at J == 32 keeps the A fragments of every iteration live: the kernel needs
+    // all VGPRs and still spills to scratch. Keeping the loop rolled removes the spill; the other J are unchanged.
+    // (from upstream PR 31751)
+    constexpr bool keep_k01_rolled = J == 32;
+#else
+    constexpr bool keep_k01_rolled = false;
+#endif // defined(RDNA3)
 
-        tile_A A[ntx];
+    if constexpr (keep_k01_rolled) {
+#pragma unroll 1
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+            const int k0 = k00 + k01;
+
+            tile_A A[ntx];
 #pragma unroll
-        for (int n = 0; n < ntx; ++n) {
-            load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
-        }
-
-#pragma unroll
-        for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
-            tile_B B;
-            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
-
-            float dB;
-            const int j = j0 + tile_C::get_j(0);
-            if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
-                dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
-            } else {
-                dB = __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+            for (int n = 0; n < ntx; ++n) {
+                load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
             }
 
 #pragma unroll
-            for (int n = 0; n < ntx; ++n) {
-                tile_C C;
-                mma(C, A[n], B);
+            for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+                tile_B B;
+                load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+
+                float dB;
+                const int j = j0 + tile_C::get_j(0);
+                if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
+                    dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+                } else {
+                    dB = __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                }
 
 #pragma unroll
-                for (int l = 0; l < tile_C::ne; ++l) {
-                    const int i = i0 + n*tile_A::I + tile_C::get_i(l);
-                    const float dA = x_df[i*sram_stride + k0/QI8_0];
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                for (int n = 0; n < ntx; ++n) {
+                    tile_C C;
+                    mma(C, A[n], B);
+
+#pragma unroll
+                    for (int l = 0; l < tile_C::ne; ++l) {
+                        const int i = i0 + n*tile_A::I + tile_C::get_i(l);
+                        const float dA = x_df[i*sram_stride + k0/QI8_0];
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                    }
+                }
+            }
+        }
+    } else {
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+            const int k0 = k00 + k01;
+
+            tile_A A[ntx];
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+            }
+
+#pragma unroll
+            for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+                tile_B B;
+                load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+
+                float dB;
+                const int j = j0 + tile_C::get_j(0);
+                if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
+                    dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+                } else {
+                    dB = __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                }
+
+#pragma unroll
+                for (int n = 0; n < ntx; ++n) {
+                    tile_C C;
+                    mma(C, A[n], B);
+
+#pragma unroll
+                    for (int l = 0; l < tile_C::ne; ++l) {
+                        const int i = i0 + n*tile_A::I + tile_C::get_i(l);
+                        const float dA = x_df[i*sram_stride + k0/QI8_0];
+                        sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                    }
                 }
             }
         }
