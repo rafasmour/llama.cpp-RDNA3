@@ -288,13 +288,13 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna3(ggml_type
         case GGML_TYPE_IQ2_S:   return 4;
         case GGML_TYPE_IQ2_XS:  return 4;
         case GGML_TYPE_IQ2_XXS: return 4;
-        case GGML_TYPE_IQ3_S:   return 4;
+        case GGML_TYPE_IQ3_S:   return 8;
         case GGML_TYPE_IQ3_XXS: return 4;
         case GGML_TYPE_IQ4_NL:  return 6;
-        case GGML_TYPE_IQ4_XS:  return 6;
-        case GGML_TYPE_Q4_K:    return 4;
-        case GGML_TYPE_Q5_K:    return 4;
-        case GGML_TYPE_Q6_K:    return 4;
+        case GGML_TYPE_IQ4_XS:  return 8;
+        case GGML_TYPE_Q4_K:    return 8;
+        case GGML_TYPE_Q5_K:    return 8;
+        case GGML_TYPE_Q6_K:    return 8;
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }
