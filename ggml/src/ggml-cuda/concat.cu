@@ -320,3 +320,103 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     }
 }
+
+#define CUDA_CONCAT_STORE_MAX_HEAD 16
+
+// dst[row] = { src0[row][0..n0), src1[row][0..n1) }, store[row] = the last n0 elements of dst[row].
+// One thread per row; store may be the memory that src0 is read from, so a thread reads its src0 row before it writes.
+static __global__ void concat_dim0_store_f32(
+        const float * src0, const float * src1, float * dst, float * store,
+        const int n0, const int n1, const int nrows,
+        const int64_t s0_2, const int64_t s1_0, const int64_t s1_1, const int64_t s1_2,
+        const int64_t dst_2, const int64_t store_2) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int seq = blockIdx.y;
+    if (row >= nrows) {
+        return;
+    }
+
+    const float * a = src0 + seq * s0_2 + (int64_t) row * n0;
+    const float * b = src1 + seq * s1_2 + (int64_t) row * s1_1;
+
+    float head[CUDA_CONCAT_STORE_MAX_HEAD];
+#pragma unroll
+    for (int k = 0; k < CUDA_CONCAT_STORE_MAX_HEAD; ++k) {
+        head[k] = k < n0 ? a[k] : 0.0f;
+    }
+
+    float * d  = dst   + seq * dst_2   + (int64_t) row * (n0 + n1);
+    float * st = store + seq * store_2 + (int64_t) row * n0;
+
+#pragma unroll
+    for (int k = 0; k < CUDA_CONCAT_STORE_MAX_HEAD; ++k) {
+        if (k < n0) {
+            d[k] = head[k];
+        }
+    }
+    for (int t = 0; t < n1; ++t) {
+        d[n0 + t] = b[t * s1_0];
+    }
+#pragma unroll
+    for (int k = 0; k < CUDA_CONCAT_STORE_MAX_HEAD; ++k) {
+        if (k < n0) {
+            const int j = n1 + k; // column of the result
+            st[k] = j < n0 ? head[j] : b[(j - n0) * s1_0];
+        }
+    }
+}
+
+bool ggml_cuda_can_concat_store(const ggml_tensor * concat, const ggml_tensor * view, const ggml_tensor * cpy) {
+    const ggml_tensor * src0 = concat->src[0];
+    const ggml_tensor * src1 = concat->src[1];
+
+    if (((const int32_t *) concat->op_params)[0] != 0 ||
+            concat->type != GGML_TYPE_F32 || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || cpy->type != GGML_TYPE_F32 ||
+            concat->ne[3] != 1 || !ggml_is_contiguous(concat) || !ggml_is_contiguous(src0)) {
+        return false;
+    }
+
+    const int64_t n0 = src0->ne[0];
+    const int64_t n1 = src1->ne[0];
+    // the rows are short: a state of a few columns and the tokens of a small batch
+    if (n0 < 1 || n0 > CUDA_CONCAT_STORE_MAX_HEAD || n1 < 1 || n1 > 8) {
+        return false;
+    }
+
+    // the copy source is the last n0 columns of every row of the result
+    if (view->view_src != concat || view->view_offs != (size_t) n1 * sizeof(float) ||
+            view->ne[0] != n0 || view->ne[1] != concat->ne[1] || view->ne[2] != concat->ne[2] || view->ne[3] != 1 ||
+            view->nb[0] != concat->nb[0] || view->nb[1] != concat->nb[1] || view->nb[2] != concat->nb[2]) {
+        return false;
+    }
+    if (cpy->src[0] != view) {
+        return false;
+    }
+
+    // the copy destination holds the rows of a sequence one after another
+    if (cpy->nb[0] != sizeof(float) || cpy->ne[0] != n0 * concat->ne[1] || cpy->ne[1] != concat->ne[2] ||
+            cpy->ne[2] != 1 || cpy->ne[3] != 1 || cpy->nb[1] % sizeof(float) != 0) {
+        return false;
+    }
+
+    return src1->nb[0] % sizeof(float) == 0 && src1->nb[1] % sizeof(float) == 0 && src1->nb[2] % sizeof(float) == 0;
+}
+
+void ggml_cuda_op_concat_store(ggml_backend_cuda_context & ctx, ggml_tensor * concat, ggml_tensor * cpy) {
+    const ggml_tensor * src0 = concat->src[0];
+    const ggml_tensor * src1 = concat->src[1];
+
+    const int n0    = src0->ne[0];
+    const int n1    = src1->ne[0];
+    const int nrows = concat->ne[1];
+    const int nseqs = concat->ne[2];
+
+    const dim3 block_nums((nrows + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE, nseqs, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, CUDA_CONCAT_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(concat_dim0_store_f32, launch_params,
+        (const float *) src0->data, (const float *) src1->data, (float *) concat->data, (float *) cpy->data,
+        n0, n1, nrows,
+        (int64_t) (src0->nb[2] / sizeof(float)),
+        (int64_t) (src1->nb[0] / sizeof(float)), (int64_t) (src1->nb[1] / sizeof(float)), (int64_t) (src1->nb[2] / sizeof(float)),
+        (int64_t) (concat->nb[2] / sizeof(float)), (int64_t) (cpy->nb[1] / sizeof(float)));
+}
