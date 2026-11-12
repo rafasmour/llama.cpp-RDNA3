@@ -2195,7 +2195,8 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor, const ggml_tensor * gate = nullptr) {
+// unary: the fusion of an activation (sigmoid, or bias + softplus + factor), which float weights support for a few columns
+static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor, const ggml_tensor * gate = nullptr, const bool unary = false) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -2215,8 +2216,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor, cons
         return false;
     }
 
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    //we only support fusion for ncols_dst = 1, and the activation of F32 weights for the columns of mul_mat_vec_f
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 &&
+            !(unary && src0->type == GGML_TYPE_F32 && dst->ne[1] <= MMVF_MAX_BATCH_SIZE)) {
         return false;
     }
 
@@ -5052,8 +5054,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 }
                 bias = add_node->src[1];
                 mul  = unary_node == out_node->src[0] ? out_node->src[1] : out_node->src[0];
-                if (node->ne[2] != 1 || node->ne[3] != 1 || !ggml_are_same_shape(add_node->src[0], bias) || bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) ||
-                        !ggml_are_same_shape(out_node, mul) || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) ||
+                // the bias and the factor hold one value per row, which is broadcast when there are several columns
+                const auto is_row = [&](const ggml_tensor * t) {
+                    return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == node->ne[0] &&
+                           ggml_nelements(t) == node->ne[0];
+                };
+                if (node->ne[2] != 1 || node->ne[3] != 1 || !is_row(bias) || !is_row(mul) ||
                         (out_node->src[0] != unary_node && out_node->src[1] != unary_node)) {
                     continue;
                 }
@@ -5071,7 +5077,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
 
             // the fused kernel takes the output node, which carries no precision request
-            if (ggml_prec_get_acc(node) != GGML_PREC_UNDEFINED || !ggml_cuda_should_fuse_mul_mat_vec_f(node)) {
+            if (ggml_prec_get_acc(node) != GGML_PREC_UNDEFINED) {
+                continue;
+            }
+            const bool use_mmvf = ggml_cuda_should_fuse_mul_mat_vec_f(node, nullptr, true);
+            // the bias is passed as a row here, so that the layout check of the bias fusion does not apply
+            if (!use_mmvf && !ggml_cuda_should_fuse_mul_mat_vec_q(node, out_node)) {
                 continue;
             }
 
@@ -5080,7 +5091,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion_data.unary_op  = ggml_get_unary_op(unary_node);
             fusion_data.unary_mul = mul;
 
-            ggml_cuda_mul_mat_vec_f(*cuda_ctx, node->src[0], node->src[1], nullptr, out_node, &fusion_data);
+            if (use_mmvf) {
+                ggml_cuda_mul_mat_vec_f(*cuda_ctx, node->src[0], node->src[1], nullptr, out_node, &fusion_data);
+            } else {
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, out_node, &fusion_data);
+            }
             return n_ops - 1;
         }
     }

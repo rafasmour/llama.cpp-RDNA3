@@ -397,7 +397,7 @@ static __global__ void mul_mat_vec_f(
             value *= x_scale[ids ? channel_x : 0];
         }
         if (use_bias) {
-            value += x_bias[tid*stride_col_dst + row];
+            value += x_bias[(fusion.x_bias_row ? 0 : tid*stride_col_dst) + row];
         }
 
         if (fusion.unary_op == GGML_UNARY_OP_SIGMOID) {
@@ -461,8 +461,10 @@ static void mul_mat_vec_f_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
         fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.unary_op != GGML_UNARY_OP_COUNT;
-    if constexpr (ncols_dst == 1) {
+    // several columns: only the activation of F32 weights
+    if constexpr (ncols_dst == 1 || (std::is_same_v<T, float> && !is_multi_token_id)) {
         if (has_fusion) {
+            GGML_ASSERT(ncols_dst == 1 || (fusion.unary_op != GGML_UNARY_OP_COUNT && fusion.gate == nullptr));
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
                 x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -728,7 +730,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || (fusion->unary_op != GGML_UNARY_OP_COUNT && src0->type == GGML_TYPE_F32));
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_F8_E4M3);
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
@@ -768,8 +770,14 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             GGML_ASSERT(fusion->unary_op != GGML_UNARY_OP_COUNT);
             GGML_ASSERT(fusion->unary_mul->type == GGML_TYPE_F32);
             GGML_ASSERT(ggml_is_contiguous(fusion->unary_mul));
-            GGML_ASSERT(fusion->unary_mul->ne[0] == dst->ne[0]);
+            GGML_ASSERT(ggml_nelements(fusion->unary_mul) == dst->ne[0]);
             fusion_local.unary_mul = fusion->unary_mul->data;
+        }
+        // a bias column that is broadcast over the dst columns
+        if (fusion->x_bias && !ids && dst->ne[1] > 1) {
+            GGML_ASSERT(ggml_nelements(fusion->x_bias) == dst->ne[0] && ggml_is_contiguous(fusion->x_bias));
+            GGML_ASSERT(dst->ne[2] == 1 && dst->ne[3] == 1);
+            fusion_local.x_bias_row = true;
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;

@@ -12151,6 +12151,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // gated delta net gates with quantized weights and with several tokens (speculative verify), odd row count
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int64_t n : {1, 2, 5, 8, 9}) {
+            for (bool softplus : {false, true}) {
+                if (type_a != GGML_TYPE_F32 || (n != 1 && n != 4)) {
+                    test_cases.emplace_back(new test_mul_mat_gate(type_a, 32, n, 2048, softplus));
+                }
+                test_cases.emplace_back(new test_mul_mat_gate(type_a, 33, n, 512, softplus));
+            }
+        }
+    }
+
     // few src1 rows (speculative verify): odd m, a single K block, long K, every tile width, broadcast batches
     for (int64_t n : {2, 3, 5, 8, 9, 13, 16}) {
         for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{40, 32}, {100, 96}, {1000, 5120}, {3000, 1024}, {6144, 5120}, {17408, 512}}) {
