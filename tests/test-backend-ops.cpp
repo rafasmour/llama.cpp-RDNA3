@@ -8377,6 +8377,55 @@ struct test_unary_mul_mul_mat : public test_case {
     }
 };
 
+// The conv state of a recurrent layer: the new input is appended to the state columns (concat along dim 0)
+// and the last columns of the result are copied back into the state, which backends may do in one pass.
+struct test_concat_state_store : public test_case {
+    const int64_t n_state;  // state columns per channel
+    const int64_t n_tokens;
+    const int64_t n_channels;
+    const int64_t n_seqs;
+
+    test_concat_state_store(int64_t n_state, int64_t n_tokens, int64_t n_channels, int64_t n_seqs)
+        : n_state(n_state), n_tokens(n_tokens), n_channels(n_channels), n_seqs(n_seqs) {}
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_state, n_tokens, n_channels, n_seqs);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONCAT_STATE_STORE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // the state cells of all sequences, with one unused cell in front
+        ggml_tensor * cells = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state * n_channels, n_seqs + 1);
+        ggml_set_name(cells, "cells");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_channels, n_tokens, n_seqs);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * state = ggml_view_2d(ctx, cells, n_state * n_channels, n_seqs, cells->nb[1], cells->nb[1]);
+        state = ggml_reshape_3d(ctx, state, n_state, n_channels, n_seqs);
+
+        ggml_tensor * xt = ggml_permute(ctx, x, 1, 0, 2, 3); // [n_tokens, n_channels, n_seqs]
+
+        ggml_tensor * conv_x = ggml_concat(ctx, state, xt, 0);
+
+        ggml_tensor * last = ggml_view_3d(ctx, conv_x, n_state, n_channels, n_seqs,
+                conv_x->nb[1], conv_x->nb[2], ggml_row_size(conv_x->type, n_tokens));
+        ggml_tensor * cell = ggml_view_2d(ctx, cells, n_state * n_channels, n_seqs, cells->nb[1], cells->nb[1]);
+        ggml_tensor * stored = ggml_cpy(ctx, last, cell);
+
+        // the result holds the concatenated input and the new state
+        ggml_tensor * out = ggml_concat(ctx, conv_x, ggml_reshape_3d(ctx, stored, n_state, n_channels, n_seqs), 0);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // mul_mat followed by an add of a residual, which backends may fuse into the mat-mul
 struct test_mul_mat_add : public test_case {
     const ggml_type type_a;
@@ -12271,6 +12320,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // conv state of a recurrent layer: kernel sizes 2 to 15, one token and a few, one and several sequences,
+    // more tokens than state columns, and shapes the fused path does not take
+    for (int64_t n_state : {1, 3, 6, 14, 17}) {
+        for (int64_t n_tokens : {1, 2, 5, 8, 9}) {
+            for (int64_t n_seqs : {1, 3}) {
+                test_cases.emplace_back(new test_concat_state_store(n_state, n_tokens, 300, n_seqs));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_concat_state_store(3, 1, 8192, 1));
+    test_cases.emplace_back(new test_concat_state_store(3, 1, 8192, 4));
+
     // output gate of a block followed by the quantized output projection
     for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
         for (ggml_unary_op op : {GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID}) {

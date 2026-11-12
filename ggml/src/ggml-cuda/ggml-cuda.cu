@@ -5204,6 +5204,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // concat of a conv state with the new input + the copy of the last columns back into the state
+    if (node->op == GGML_OP_CONCAT && i + 3 < cgraph->n_nodes) {
+        const ggml_op ops[]     = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY };
+        // the view of the state cells is listed as an output: its source is outside of the subgraph
+        const int     outputs[] = { i, i + 2, i + 3 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 4, ops, outputs, 3) &&
+                cgraph->nodes[i + 3]->src[1] == cgraph->nodes[i + 2] &&
+                ggml_cuda_can_concat_store(node, cgraph->nodes[i + 1], cgraph->nodes[i + 3])) {
+            ggml_cuda_op_concat_store(*cuda_ctx, node, cgraph->nodes[i + 3]);
+            return 3;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
