@@ -366,6 +366,9 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 
+# flash attention must not depend on the data of masked KV cells (run on the device, not part of ctest)
+llama_build(test-fattn-masked.cpp LINK ggml Threads::Threads)
+
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 
 if (BUILD_SHARED_LIBS)

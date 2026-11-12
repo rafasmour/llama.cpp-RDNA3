@@ -636,6 +636,57 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
     }
 }
 
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+// The RDNA3 WMMA instruction with half precision accumulation adds the products of the KV rows 2*n and 2*n + 1 first.
+// If one of the two products is -0 and the other one is not zero, a tie of the result is rounded down instead of to even.
+// The product of a masked row is the V value times a weight of +0, so its sign is the one of the V value and the
+// result for the visible rows would depend on the data of masked rows. The rows that no column of the block sees
+// hold arbitrary data: values of removed tokens or of other sequences. They are set to zero in the V tile for
+// that reason, which makes all of their products +0.
+//
+// Each thread stores the number of the KV tile + 1 in the two values behind the first row of the mask tile:
+// the first one if any of its mask values is negative, the second one if any of its softmax weights is not zero.
+// Only a tile with both can have such rows next to visible ones.
+template<int nbatch_fa>
+static __device__ __forceinline__ int * flash_attn_ext_f16_get_tile_flags(half * const __restrict__ tile_mask) {
+    return (int *) (tile_mask + nbatch_fa);
+}
+
+// Replaces the first row of the mask tile: -inf for the rows that are masked with -inf for all columns, 0 for the others.
+template<int ncols1, int nwarps, int nbatch_fa>
+static __device__ __forceinline__ void flash_attn_ext_f16_mark_masked_rows(half * const __restrict__ tile_mask) {
+    constexpr int      warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr uint16_t neg_inf   = 0xFC00; // a finite negative value is a bias and not a masked row
+    uint16_t * mask_bits = (uint16_t *) tile_mask;
+    for (int i = threadIdx.y*warp_size + threadIdx.x; i < nbatch_fa; i += nwarps*warp_size) {
+        bool all_masked = true;
+#pragma unroll
+        for (int j = 0; j < ncols1; ++j) {
+            all_masked = all_masked && mask_bits[j*(nbatch_fa + 8) + i] == neg_inf;
+        }
+        mask_bits[i] = all_masked ? neg_inf : 0;
+    }
+}
+
+// Sets the rows of the KV tile to zero that flash_attn_ext_f16_mark_masked_rows marked.
+template<int stride_tile, int nwarps, int nbatch_fa>
+static __device__ __forceinline__ void flash_attn_ext_f16_zero_masked_rows(
+        half2 * const __restrict__ tile_KV, const half * const __restrict__ tile_mask, const int D2) {
+    constexpr int warp_size    = ggml_cuda_get_physical_warp_size();
+    constexpr int chunk_size   = 16;
+    constexpr int h2_per_chunk = chunk_size / sizeof(half2);
+    const int chunks_per_row = D2 / h2_per_chunk;
+    const half2 zero[4] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
+    for (int i = threadIdx.y; i < nbatch_fa; i += nwarps) {
+        if (((const uint16_t *) tile_mask)[i] != 0) {
+            for (int k = threadIdx.x; k < chunks_per_row; k += warp_size) {
+                ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile_KV, i*stride_tile + k*h2_per_chunk, i), zero);
+            }
+        }
+    }
+}
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
     bool use_logit_softcap, bool V_is_K_view, bool use_sparse, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
     typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ>
@@ -805,6 +856,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         KQ_max_new[col] = KQ_max[col];
     }
     float KQ_rowsum_add[cols_per_thread] = {0.0f};
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+    float mask_min = 0.0f; // negative if the thread may have a masked value
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
 
     if constexpr (cols_per_warp == 8) {
         if (ncols2 > 1 || mask_h) {
@@ -882,7 +936,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     const int i = i0 + T_C_KQ::get_j(l);
                     const int j = ((threadIdx.y / np)*cols_per_warp + T_C_KQ::get_i(l)) / ncols2;
 
-                    KQ_C[i00/(np*T_C_KQ::J)].x[l] += __half2float(tile_mask[j*(nbatch_fa + 8) + i]);
+                    const float mask_val = __half2float(tile_mask[j*(nbatch_fa + 8) + i]);
+                    KQ_C[i00/(np*T_C_KQ::J)].x[l] += mask_val;
+#if defined(AMD_WMMA_AVAILABLE)
+                    mask_min = fminf(mask_min, mask_val);
+#endif // defined(AMD_WMMA_AVAILABLE)
                 }
 #else
 #pragma unroll
@@ -961,6 +1019,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 }
             }
         }
+
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+        if constexpr (!V_is_K_view) {
+            if (ncols2 > 1 || mask_h) {
+                // see flash_attn_ext_f16_get_tile_flags
+                int * tile_flags = flash_attn_ext_f16_get_tile_flags<nbatch_fa>(tile_mask);
+                if (mask_min < 0.0f) {
+                    tile_flags[0] = kb0 + 1;
+                }
+                if (KQ_rowsum_add[0] > 0.0f) {
+                    tile_flags[1] = kb0 + 1;
+                }
+            }
+        }
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
     }
 
     {
@@ -1081,6 +1154,24 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     cp_async_wait_all();
                 }
                 __syncthreads();
+
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+                if constexpr (!V_is_K_view) {
+                    static_assert(nstages == 0, "the mask tile must still hold the mask of this KV tile");
+                    if (ncols2 > 1 || mask_h) {
+                        // see flash_attn_ext_f16_get_tile_flags
+                        const int * tile_flags = flash_attn_ext_f16_get_tile_flags<nbatch_fa>(tile_mask);
+                        if (tile_flags[0] == kb0 + 1 && tile_flags[1] == kb0 + 1) {
+                            if (i0_start == 0) {
+                                flash_attn_ext_f16_mark_masked_rows<ncols1, nwarps, nbatch_fa>(tile_mask);
+                                __syncthreads();
+                            }
+                            flash_attn_ext_f16_zero_masked_rows<stride_tile_V, nwarps, nbatch_fa>(tile_V, tile_mask, i0_diff/2);
+                            __syncthreads();
+                        }
+                    }
+                }
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
             }
         }
         const int tile_V_offset_i = !V_is_K_view || i0_stop > 2*nbatch_K2 ? 0 : i0_start/2;
