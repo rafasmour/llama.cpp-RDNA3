@@ -76,8 +76,10 @@ static bool can_reuse_attn_mask(
     const uint32_t n_slices  = llama_kv_cache::get_n_kv_slices(ubatch);
     const auto     n_tokens  = ubatch.n_tokens;
 
-    // the current ubatch uses rows only when rows are enabled and it can split into streams
-    const bool use_rows = n_kv_rows > 0 && n_slices > 0;
+    // the current ubatch uses rows only when rows are enabled and it can split into streams.
+    // a mask that is always built over the whole cache has no rows either way: without this check its graph
+    // would be rebuilt for every ubatch of a unified cache
+    const bool use_rows = attn_mask.rows_aware && n_kv_rows > 0 && n_slices > 0;
 
     // the previous mask and the current ubatch must agree on the layout
     if (use_rows != (attn_mask.rows != nullptr)) {
@@ -107,6 +109,7 @@ static llm_attn_mask build_attn_inp_attn_mask(
         const llama_cparams & cparams) {
     llm_attn_mask attn_mask;
 
+    attn_mask.rows_aware = true;
     attn_mask.n_kv = mctx->get_n_kv();
 
     const uint32_t n_kv_rows = cparams.fused_kv_rows ? mctx->get_n_kv_rows() : 0;

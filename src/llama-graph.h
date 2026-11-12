@@ -341,6 +341,10 @@ struct llm_attn_mask {
     ggml_tensor * rows = nullptr; // I32 [n_kv_rows, n_slices]
     uint32_t      n_kv = 0;
 
+    // built by build_attn_inp_attn_mask, which uses kv_rows when the cache has them.
+    // false for the inputs that always build the mask over the whole cache
+    bool rows_aware = false;
+
     // fill every token of a sequence with the mask row of its first token (dspark draft blocks)
     bool block_uniform = false;
 };
