@@ -288,14 +288,29 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna3(ggml_type
         case GGML_TYPE_IQ2_S:   return 4;
         case GGML_TYPE_IQ2_XS:  return 4;
         case GGML_TYPE_IQ2_XXS: return 4;
-        case GGML_TYPE_IQ3_S:   return 8;
+        case GGML_TYPE_IQ3_S:   return 4;
         case GGML_TYPE_IQ3_XXS: return 4;
         case GGML_TYPE_IQ4_NL:  return 6;
-        case GGML_TYPE_IQ4_XS:  return 8;
-        case GGML_TYPE_Q4_K:    return 8;
-        case GGML_TYPE_Q5_K:    return 8;
-        case GGML_TYPE_Q6_K:    return 8;
+        case GGML_TYPE_IQ4_XS:  return 6;
+        case GGML_TYPE_Q4_K:    return 4;
+        case GGML_TYPE_Q5_K:    return 4;
+        case GGML_TYPE_Q6_K:    return 4;
         default:                return MMVQ_MAX_BATCH_SIZE;
+    }
+}
+
+// RDNA3 desktop parts (RX 7900 XT): the mat-vec kernel stays ahead of the quantized mat-mul kernel up to 8 tokens
+// for the types that the wider steps of get_vdr_mmvq and the models at hand cover.
+static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna3_0(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return MMVQ_MAX_BATCH_SIZE;
+        default:
+            return get_mmvq_mmid_max_batch_rdna3(type);
     }
 }
 
@@ -343,6 +358,9 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_RDNA4(cc)) {
             return get_mmvq_mmid_max_batch_rdna4(type);
+        }
+        if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+            return get_mmvq_mmid_max_batch_rdna3_0(type);
         }
         if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc)) {
             return get_mmvq_mmid_max_batch_rdna3(type);
@@ -477,6 +495,8 @@ template <ggml_type type>
 static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #if defined(RDNA4)
     return get_mmvq_mmid_max_batch_rdna4(type);
+#elif defined(RDNA3_0)
+    return get_mmvq_mmid_max_batch_rdna3_0(type);
 #elif defined(RDNA3) || defined(RDNA4_M)
     return get_mmvq_mmid_max_batch_rdna3(type);
 #elif defined(RDNA2) || defined(RDNA1)
