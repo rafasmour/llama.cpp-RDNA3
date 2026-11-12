@@ -753,13 +753,18 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :
     concurrent_stream_context(std::make_unique<ggml_cuda_stream_context>()) {
 }
 
-void ggml_backend_cuda_context::ggml_cuda_q8_1_cache::set(const ggml_tensor * src1, const int64_t (& a)[8]) {
+void ggml_backend_cuda_context::ggml_cuda_q8_1_cache::set(const ggml_tensor * src1, const int64_t (& a)[8], const ggml_tensor * writer_node) {
     data    = src1->data;
     src_end = (uintptr_t) src1->data + ggml_backend_buft_get_alloc_size(src1->buffer->buft, src1);
+    writer  = writer_node;
     memcpy(args, a, sizeof(args));
 }
 
 void ggml_backend_cuda_context::ggml_cuda_q8_1_cache::invalidate_if_written(const ggml_tensor * node) {
+    if (node == writer) {
+        // the node made the copy from the data that it wrote
+        return;
+    }
     if (buf && (uintptr_t) node->data < src_end &&
         (uintptr_t) data < (uintptr_t) node->data + ggml_backend_buft_get_alloc_size(node->buffer->buft, node)) {
         clear();
@@ -2266,6 +2271,41 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(
     }
 
     return use_mul_mat_vec_q;
+}
+
+// The src1 of the quantized mat-vec that reads the output of node out_idx, when that mat-vec is the next one to use the
+// q8_1 cache: the kernel that writes the output can then write the q8_1 copy as well, which saves the quantize launch.
+// A wrong guess only costs the copy, ggml_cuda_mul_mat_vec_q checks the cache key.
+static const ggml_tensor * ggml_cuda_q8_1_consumer(const ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int out_idx) {
+    const ggml_tensor * out = cgraph->nodes[out_idx];
+    if (cuda_ctx->curr_stream_no != 0 || out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) ||
+            out->ne[0] % MATRIX_ROW_PADDING != 0) {
+        return nullptr;
+    }
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    constexpr int max_lookahead = 16;
+    for (int j = out_idx + 1; j < cgraph->n_nodes && j <= out_idx + max_lookahead; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if ((n->op != GGML_OP_MUL_MAT && n->op != GGML_OP_MUL_MAT_ID) || !ggml_is_quantized(n->src[0]->type)) {
+            continue; // does not touch the cache
+        }
+        const ggml_tensor * src0 = n->src[0];
+        const ggml_tensor * src1 = n->src[1];
+        // MUL_MAT_ID shares the copy only with one src1 row per token, see ggml_cuda_mul_mat_vec_q
+        const bool mmvq = n->op == GGML_OP_MUL_MAT_ID
+            ? n->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc) && src1->ne[1] == 1
+            : ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]);
+        const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                                       ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                       src0->view_src;
+        if (!mmvq || bad_padding_clear || src1->data != out->data || src1->type != GGML_TYPE_F32 || n->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(src1) || src1->ne[0] != out->ne[0] || ggml_nelements(src1) != ggml_nelements(out) ||
+                (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return nullptr;
+        }
+        return src1;
+    }
+    return nullptr;
 }
 
 static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
@@ -5177,7 +5217,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], ggml_cuda_q8_1_consumer(cuda_ctx, cgraph, i + 1));
         return 1;
     }
 
