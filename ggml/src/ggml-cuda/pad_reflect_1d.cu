@@ -77,7 +77,9 @@ void ggml_cuda_op_pad_reflect_1d(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // sanity: padded length matches
     GGML_ASSERT(ne0 == ne00 + p0 + p1);
 
-    constexpr int64_t bx     = CUDA_PAD_REFLECT_1D_BLOCK_SIZE;  // threads per block (x)
+    // threads per block (x): not more than a row has elements. A tensor with many short rows would otherwise launch
+    // mostly idle threads, and grid size * block size has to stay below 2^32 on HIP.
+    const int64_t     bx     = std::min<int64_t>(CUDA_PAD_REFLECT_1D_BLOCK_SIZE, ne0);
     const int64_t     tiles0 = (ne0 + bx - 1) / bx;             // number of tiles along i0
     // grid.x covers i1 and all tiles of i0: [ne01 * tiles0]
     // grid.y covers i2: [ne02]
