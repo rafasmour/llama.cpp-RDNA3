@@ -8,11 +8,16 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <functional>
+#include <mutex>
 #include <random>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -217,6 +222,14 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    // candidates computed by common_sampler_prepare for rows of the last decode
+    struct prepared_row {
+        int    idx         = -1;
+        size_t n_preselect = 0;
+        std::vector<llama_token_data> cur;
+    };
+    std::vector<prepared_row> prepared;
+
     void reset() {
         prev.clear();
 
@@ -250,7 +263,18 @@ struct common_sampler {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
             if (n_preselect > 0 && n_preselect*4 <= (size_t) n_vocab) {
-                common_sampler_preselect(logits, n_vocab, n_preselect, params.logit_bias, cur);
+                bool is_prepared = false;
+                for (auto & row : prepared) {
+                    if (row.idx == idx && row.n_preselect == n_preselect) {
+                        cur.swap(row.cur);
+                        row.idx = -1;
+                        is_prepared = true;
+                        break;
+                    }
+                }
+                if (!is_prepared) {
+                    common_sampler_preselect(logits, n_vocab, n_preselect, params.logit_bias, cur);
+                }
             } else {
                 cur.resize(n_vocab);
                 for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
@@ -698,6 +722,152 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     }
 
     return gsmpl->chain;
+}
+
+// worker threads of common_sampler_prepare, started on first use
+namespace {
+struct sampler_workers {
+    std::mutex              mtx;
+    std::condition_variable cv_job;
+    std::condition_variable cv_done;
+    std::vector<std::thread> threads;
+
+    const std::function<void(size_t)> * job = nullptr;
+    size_t              n_items   = 0;
+    std::atomic<size_t> next{0};
+    size_t              n_running = 0;
+    uint64_t            job_id    = 0;
+    bool                stop      = false;
+
+    ~sampler_workers() {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            stop = true;
+        }
+        cv_job.notify_all();
+        for (auto & t : threads) {
+            t.join();
+        }
+    }
+
+    // calls fn(i) for i in [0, n), on the calling thread and the workers
+    void run(size_t n, int n_threads, const std::function<void(size_t)> & fn) {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            while ((int) threads.size() < n_threads - 1) {
+                threads.emplace_back([this] { work(); });
+            }
+            job       = &fn;
+            n_items   = n;
+            next      = 0;
+            n_running = threads.size();
+            job_id++;
+        }
+        cv_job.notify_all();
+
+        for (size_t i; (i = next.fetch_add(1)) < n; ) {
+            fn(i);
+        }
+
+        std::unique_lock<std::mutex> lock(mtx);
+        cv_done.wait(lock, [this] { return n_running == 0; });
+    }
+
+    void work() {
+        uint64_t seen = 0;
+        std::unique_lock<std::mutex> lock(mtx);
+        while (true) {
+            cv_job.wait(lock, [&] { return stop || job_id != seen; });
+            if (stop) {
+                return;
+            }
+            seen = job_id;
+            const auto & fn = *job;
+            const size_t n  = n_items;
+            lock.unlock();
+            for (size_t i; (i = next.fetch_add(1)) < n; ) {
+                fn(i);
+            }
+            lock.lock();
+            if (--n_running == 0) {
+                cv_done.notify_one();
+            }
+        }
+    }
+};
+} // namespace
+
+void common_sampler_prepare_reset(struct common_sampler * gsmpl) {
+    if (gsmpl) {
+        gsmpl->prepared.clear();
+    }
+}
+
+void common_sampler_prepare(struct llama_context * ctx, const std::vector<common_sampler_row> & rows, int n_threads) {
+    if (rows.empty()) {
+        return;
+    }
+
+    llama_synchronize(ctx);
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    int32_t n_suppress = 0;
+    llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+
+    struct item {
+        common_sampler * smpl;
+        size_t           i_prepared;
+        const float *    logits;
+    };
+    std::vector<item> items;
+
+    for (const auto & row : rows) {
+        auto * gsmpl = row.smpl;
+        if (!gsmpl || row.idx < 0) {
+            continue;
+        }
+        // a backend sampler already reduced or sampled the row
+        if (llama_get_sampled_probs_ith(ctx, row.idx) || llama_get_sampled_logits_ith(ctx, row.idx) ||
+                llama_get_sampled_token_ith(ctx, row.idx) != LLAMA_TOKEN_NULL) {
+            continue;
+        }
+        const size_t n_preselect = common_sampler_n_preselect(gsmpl->params, n_suppress);
+        if (n_preselect == 0 || n_preselect*4 > (size_t) n_vocab) {
+            continue;
+        }
+        const float * logits = llama_get_logits_ith(ctx, row.idx);
+        if (!logits) {
+            continue;
+        }
+        gsmpl->prepared.emplace_back();
+        gsmpl->prepared.back().idx         = row.idx;
+        gsmpl->prepared.back().n_preselect = n_preselect;
+        items.push_back({ gsmpl, gsmpl->prepared.size() - 1, logits });
+    }
+
+    if (items.empty()) {
+        return;
+    }
+
+    // the entries are in place, the threads only fill the candidates of their own entry
+    const std::function<void(size_t)> fn = [&](size_t i) {
+        const auto & it  = items[i];
+        auto &       row = it.smpl->prepared[it.i_prepared];
+        common_sampler_preselect(it.logits, n_vocab, row.n_preselect, it.smpl->params.logit_bias, row.cur);
+    };
+
+    n_threads = std::min<int>(n_threads, (int) items.size());
+    if (n_threads <= 1) {
+        for (size_t i = 0; i < items.size(); i++) {
+            fn(i);
+        }
+        return;
+    }
+
+    static sampler_workers workers;
+    workers.run(items.size(), n_threads, fn);
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {

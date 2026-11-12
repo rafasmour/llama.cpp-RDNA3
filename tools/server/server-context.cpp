@@ -4868,6 +4868,31 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        // The candidate scan over the logits of every row that may be sampled below runs on the worker threads:
+        // with several slots, or the positions of a draft, it is the largest part of the time between two decodes.
+        {
+            std::vector<common_sampler_row> rows;
+            iterate(slots, [&](server_slot & slot) {
+                common_sampler_prepare_reset(slot.smpl.get());
+                if (!slot.smpl || !slot.task || !slot.task->need_sampling() || slot.task->type == SERVER_TASK_TYPE_TTS) {
+                    return;
+                }
+                if (slot.state != SLOT_STATE_GENERATING && slot.state != SLOT_STATE_DONE_PROMPT) {
+                    return;
+                }
+                if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && !slot.spec_draft.empty()) {
+                    for (const int32_t i : slot.spec_i_batch) {
+                        rows.push_back({ slot.smpl.get(), i });
+                    }
+                } else if (is_inside_view(slot.i_batch)) {
+                    rows.push_back({ slot.smpl.get(), slot.i_batch - off });
+                }
+            });
+            if (rows.size() > 1) {
+                common_sampler_prepare(ctx_tgt, rows, params_base.cpuparams.n_threads);
+            }
+        }
+
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
