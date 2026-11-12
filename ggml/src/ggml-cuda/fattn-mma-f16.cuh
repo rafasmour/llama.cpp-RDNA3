@@ -281,6 +281,12 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
         GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 2,  32, 128, 128,  64, 1, false);
     }
 
+    // Head size 512: the Q values of 32 columns take half of the 64 KiB of shared memory, the rest holds 64 KV rows
+    // if K and V are loaded in batches of a quarter of the head size. 64 columns do not fit.
+    if (ncols2 >= 2) {
+        GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 256, 2,  64,  64,  64,  64, 1, false);
+    }
+
     return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
 }
 
@@ -2092,12 +2098,18 @@ static __global__ void flash_attn_ext_f16(
     }
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
 
-#if defined(AMD_WMMA_AVAILABLE)
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+    // above head size 256 only the configuration of ggml_cuda_fattn_mma_get_config_rdna3
+    if (ncols1*ncols2 < 16 || ncols2 == 1 || (DKQ > 256 && !(DKQ == 512 && DV == 512 && ncols1*ncols2 == 32))) {
+        NO_DEVICE_CODE;
+        return;
+    }
+#elif defined(AMD_WMMA_AVAILABLE)
     if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 256) {
         NO_DEVICE_CODE;
         return;
     }
-#endif // defined(AMD_WMMA_AVAILABLE)
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
 
 #if defined(AMD_MFMA_AVAILABLE)
     if (ncols1*ncols2 < 16 || (DKQ > 256 && ncols1*ncols2 < 32 && !use_sparse)) {
