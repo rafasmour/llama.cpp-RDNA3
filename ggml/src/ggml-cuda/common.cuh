@@ -1460,18 +1460,20 @@ struct ggml_backend_cuda_context {
         const void * data = nullptr;
         int64_t      args[8] = {}; // ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13 of quantize_row_q8_1_cuda
         uintptr_t    src_end = 0; // the source memory range is [data, src_end)
+        const ggml_tensor * writer = nullptr; // node whose kernel wrote the source together with this copy
 
         bool matches(const ggml_tensor * src1, const int64_t (& a)[8]) const {
             return buf && data == src1->data && memcmp(args, a, sizeof(args)) == 0;
         }
 
-        void set(const ggml_tensor * src1, const int64_t (& a)[8]);
+        void set(const ggml_tensor * src1, const int64_t (& a)[8], const ggml_tensor * writer_node = nullptr);
         // drop the cache if it reads memory that the node writes
         void invalidate_if_written(const ggml_tensor * node);
 
         void clear() {
             buf.reset();
             data = nullptr;
+            writer = nullptr;
         }
     } q8_1_cache;
 };

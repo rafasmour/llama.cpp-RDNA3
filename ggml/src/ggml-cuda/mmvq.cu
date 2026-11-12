@@ -1486,6 +1486,18 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+void ggml_cuda_mmvq_q8_1_args(const ggml_tensor * src1, int64_t args[8]) {
+    const int64_t ts = ggml_type_size(src1->type);
+    args[0] = src1->ne[0];
+    args[1] = src1->nb[1] / ts;
+    args[2] = src1->nb[2] / ts;
+    args[3] = src1->nb[3] / ts;
+    args[4] = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    args[5] = src1->ne[1];
+    args[6] = src1->ne[2];
+    args[7] = src1->ne[3];
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1605,7 +1617,8 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t s11_q = src1->nb[1] / ts_src1;
     const int64_t s12_q = src1->nb[2] / ts_src1;
     const int64_t s13_q = src1->nb[3] / ts_src1;
-    const int64_t q_args[8] = { ne10, s11_q, s12_q, s13_q, ne10_padded, ne11, ne12, ne13 };
+    int64_t q_args[8];
+    ggml_cuda_mmvq_q8_1_args(src1, q_args);
 
     const bool use_cache = ctx.curr_stream_no == 0 && (!ids || ne11 == 1);
     std::unique_ptr<ggml_cuda_pool_alloc<char>> src1_q8_1_local;

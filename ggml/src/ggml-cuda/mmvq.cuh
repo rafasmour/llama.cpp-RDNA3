@@ -16,3 +16,6 @@ void ggml_cuda_op_mul_mat_vec_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
+
+// launch arguments of the q8_1 copy that ggml_cuda_mul_mat_vec_q makes of src1, the key of the q8_1 cache
+void ggml_cuda_mmvq_q8_1_args(const ggml_tensor * src1, int64_t args[8]);

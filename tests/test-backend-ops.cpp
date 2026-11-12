@@ -8272,6 +8272,59 @@ struct test_mul_mat_gate : public test_case {
     }
 };
 
+// rms_norm + mul followed by mat-muls with quantized weights, as at the start of an attention or feed-forward block:
+// backends may quantize the activations in the norm kernel and share them between the mat-muls
+struct test_rms_norm_mul_mat : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int mode; // 0: one mat-mul, 1: two mat-muls of the norm, 2: a float mat-mul first, 3: the norm is overwritten in between
+
+    test_rms_norm_mul_mat(ggml_type type_a, int64_t m, int64_t n, int64_t k, int mode)
+        : type_a(type_a), m(m), n(n), k(k), mode(mode) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, m, n, k, mode);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+
+        ggml_tensor * cur = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        ggml_tensor * out;
+        if (mode == 1) {
+            ggml_tensor * b = ggml_new_tensor_2d(ctx, type_a, k, m);
+            out = ggml_add(ctx, ggml_mul_mat(ctx, a, cur), ggml_mul_mat(ctx, b, cur));
+        } else if (mode == 2) {
+            ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+            out = ggml_add(ctx, ggml_mul_mat(ctx, r, cur), ggml_mul_mat(ctx, a, cur));
+        } else if (mode == 3) {
+            ggml_tensor * first = ggml_mul_mat(ctx, a, cur);
+            ggml_tensor * cur2  = ggml_scale_inplace(ctx, cur, 0.5f);
+            out = ggml_add(ctx, first, ggml_mul_mat(ctx, a, cur2));
+        } else {
+            out = ggml_mul_mat(ctx, a, cur);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // mul_mat followed by an add of a residual, which backends may fuse into the mat-mul
 struct test_mul_mat_add : public test_case {
     const ggml_type type_a;
@@ -12146,6 +12199,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // norm of a layer input followed by quantized mat-vecs: row lengths with and without padding of the q8_1 copy,
+    // every block size of the vectorized norm kernel, mat-vec (<= 8 tokens) and mat-mul
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (int64_t k : {256, 512, 768, 1024, 2048, 4096, 5120}) {
+            for (int64_t n : {1, 3, 8, 9}) {
+                test_cases.emplace_back(new test_rms_norm_mul_mat(type_a, 33, n, k, 0));
+            }
+        }
+        for (int mode : {1, 2, 3}) {
+            for (int64_t n : {1, 5}) {
+                test_cases.emplace_back(new test_rms_norm_mul_mat(type_a, 33, n, 1024, mode));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q4_K, 16, 2, 16384, 0));
+    test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q4_K, 16, 2, 16384 + 512, 0));
 
     // gated delta net gates with quantized weights and with several tokens (speculative verify), odd row count
     for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
