@@ -1054,6 +1054,11 @@ static void ggml_backend_cuda_buffer_set_tensor_n(ggml_backend_buffer_t buffer, 
 
     ggml_cuda_set_device(ctx->device);
 
+    if (!ggml_cuda_pinned_memory_disabled() &&
+            ggml_cuda_set_tensor_n(ctx->device, tensors, data, offsets, sizes, n_tensors)) {
+        return;
+    }
+
     for (size_t i = 0; i < n_tensors; i++) {
         if (sizes[i] == 0) {
             continue;
