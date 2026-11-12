@@ -2727,6 +2727,23 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // the storage of a checkpoint that is erased here and not shared with the prompt cache is reused for the new one:
+        // reading a state into memory that is already mapped is several times faster than into new pages
+        common_state_data spare_tgt;
+        common_state_data spare_dft;
+        const auto erase = [&](std::list<std::shared_ptr<const common_prompt_checkpoint>>::iterator it) {
+            if (it->use_count() == 1) {
+                auto & old = const_cast<common_prompt_checkpoint &>(**it);
+                if (old.data_tgt.capacity() > spare_tgt.capacity()) {
+                    spare_tgt = std::move(old.data_tgt);
+                }
+                if (old.data_dft.capacity() > spare_dft.capacity()) {
+                    spare_dft = std::move(old.data_dft);
+                }
+            }
+            return slot.prompt.checkpoints.erase(it);
+        };
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -2739,7 +2756,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-                it = slot.prompt.checkpoints.erase(it);
+                it = erase(it);
                 continue;
             }
 
@@ -2754,7 +2771,7 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            erase(slot.prompt.checkpoints.begin());
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -2763,7 +2780,7 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if ((*it)->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", (*it)->n_tokens);
-                    it = slot.prompt.checkpoints.erase(it);
+                    it = erase(it);
                 } else {
                     ++it;
                 }
@@ -2779,6 +2796,11 @@ private:
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+
+        cur.data_tgt = std::move(spare_tgt);
+        if (ctx_dft != nullptr) {
+            cur.data_dft = std::move(spare_dft);
+        }
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
