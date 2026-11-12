@@ -99,6 +99,50 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GB10
 };
 
+// The vdr of a type for a number of dst columns. On RDNA3 (RX 7900 XT) a thread takes wider steps with several
+// columns: the scales of the block and the scale and sum of each q8_1 column are then read and applied for more values
+// at once, and that per-column work is what limits the kernel there.
+static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
+    if (table_id == MMVQ_PARAMETERS_RDNA3_0) {
+        switch (type) {
+            case GGML_TYPE_Q4_K:
+                return ncols_dst == 1 ? 4 : 8;
+            case GGML_TYPE_Q5_K:
+                return ncols_dst == 1 ? 4 : 8;
+            case GGML_TYPE_Q6_K:
+                return ncols_dst == 1 ? VDR_Q6_K_Q8_1_MMVQ : 4;
+            case GGML_TYPE_Q4_0:
+                return 4;
+            case GGML_TYPE_Q8_0:
+                return ncols_dst == 1 ? 4 : 8;
+            default:
+                break;
+        }
+    }
+    return get_vdr_mmvq(type);
+}
+
+// The dot product of a type that takes vdr ints per call.
+static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type, int vdr) {
+    if (vdr == get_vdr_mmvq(type)) {
+        return get_vec_dot_q_cuda(type);
+    }
+    switch (type) {
+        case GGML_TYPE_Q4_K:
+            return vdr == 8 ? vec_dot_q4_K_q8_1_vdr<8> : vec_dot_q4_K_q8_1_vdr<4>;
+        case GGML_TYPE_Q5_K:
+            return vdr == 8 ? vec_dot_q5_K_q8_1_vdr<8> : vec_dot_q5_K_q8_1_vdr<4>;
+        case GGML_TYPE_Q6_K:
+            return vec_dot_q6_K_q8_1_vdr<4>;
+        case GGML_TYPE_Q4_0:
+            return vec_dot_q4_0_q8_1_vdr<4>;
+        case GGML_TYPE_Q8_0:
+            return vdr == 8 ? vec_dot_q8_0_q8_1_vdr<8> : vec_dot_q8_0_q8_1_vdr<4>;
+        default:
+            return nullptr;
+    }
+}
+
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
 #if defined(RDNA4)
     return MMVQ_PARAMETERS_RDNA4;
@@ -631,13 +675,13 @@ static __global__ void mul_mat_vec_q(
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+    constexpr int vdr = get_vdr_mmvq(type, ncols_dst, table_id);
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
     constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type, vdr);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
@@ -931,10 +975,10 @@ static __global__ void mul_mat_vec_q_moe(
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int vdr = get_vdr_mmvq(type, 1, get_device_table_id()); // each warp handles one token
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type, vdr);
 
     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
     if (shared_expert) {
@@ -1169,7 +1213,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     // How the K loop divides up at the baseline block width, both decisions below use these.
     constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
     constexpr int qi                    = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr                   = get_vdr_mmvq(type);
+    const int     vdr                   = get_vdr_mmvq(type, 1, table_id); // only single column launches use it below
     const int     blocks_per_row_x      = ncols_x / qk;
     const int     blocks_per_iter_1warp = vdr * warp_size / qi;
 
