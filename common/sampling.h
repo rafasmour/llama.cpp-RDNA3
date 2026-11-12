@@ -74,6 +74,20 @@ size_t common_sampler_n_preselect(const common_params_sampling & params, size_t 
 // Fills cur with the n largest logits and the tokens with a positive logit bias, in token order.
 void common_sampler_preselect(const float * logits, int32_t n_vocab, size_t n, const std::vector<llama_logit_bias> & logit_bias, std::vector<llama_token_data> & cur);
 
+// A row of logits that a sampler is going to sample from.
+struct common_sampler_row {
+    struct common_sampler * smpl;
+    int                     idx;
+};
+
+// Computes the candidates of the rows (the scan of common_sampler_preselect) ahead of common_sampler_sample, on up to
+// n_threads threads when there are several rows; common_sampler_sample then takes them instead of scanning the logits.
+// Rows of a chain that needs all the logits, or that a backend sampler handles, are left to common_sampler_sample.
+// The candidates are only valid for the logits of the last decode: drop them with common_sampler_prepare_reset
+// before the next call (for every sampler that was passed here), also when a row was not sampled.
+void common_sampler_prepare(struct llama_context * ctx, const std::vector<common_sampler_row> & rows, int n_threads);
+void common_sampler_prepare_reset(struct common_sampler * gsmpl);
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
 // generalized version of common_sampler_sample
