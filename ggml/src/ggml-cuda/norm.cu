@@ -574,6 +574,14 @@ static bool rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
         const uint3 add_nrows_packed     = init_fastdiv_values(add_nrows);
         const uint3 add_nchannels_packed = init_fastdiv_values(add_nchannels);
         const uint3 add_nsamples_packed  = init_fastdiv_values(add_nsamples);
+        if (q8_1 != nullptr) {
+            return rms_norm_f32_dispatch</*do_multiply*/true, /*do_add*/true, /*do_scale*/false, /*do_quantize*/true>(
+                blocks_num, x_t, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
+                mul_t, mul_stride_row, mul_stride_channel, mul_stride_sample,
+                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                add_t, add_stride_row, add_stride_channel, add_stride_sample,
+                add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, stream, 1.0f, q8_1);
+        }
         rms_norm_f32_dispatch</*do_multiply*/true, /*do_add*/true, /*do_scale*/false>(
             blocks_num, x_t, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
             mul_t, mul_stride_row, mul_stride_channel, mul_stride_sample,
@@ -781,7 +789,8 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               dst,
                                      ggml_tensor *               mul_tensor,
-                                     ggml_tensor *               add_tensor) {
+                                     ggml_tensor *               add_tensor,
+                                     const ggml_tensor *         q8_1_src1) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float               eps          = 0.0f;
 
@@ -849,14 +858,34 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
     const int add_nchannels = add_src->ne[2];
     const int add_nsamples  = add_src->ne[3];
 
-    rms_norm_mul_f32_cuda(rms_norm_src, mul_src,add_src,dst_d,
+    // see ggml_cuda_op_rms_norm_fused
+    void * q8_1 = nullptr;
+    int64_t q_args[8];
+    if (q8_1_src1 != nullptr) {
+        GGML_ASSERT(q8_1_src1->data == add_tensor->data && ggml_nelements(q8_1_src1) == ggml_nelements(add_tensor));
+        ggml_cuda_mmvq_q8_1_args(q8_1_src1, q_args);
+        ctx.q8_1_cache.clear();
+        ctx.q8_1_cache.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(
+            ctx.pool(), ggml_nelements(q8_1_src1) * sizeof(block_q8_1) / QK8_1);
+        q8_1 = ctx.q8_1_cache.buf->get();
+    }
+
+    const bool quantized = rms_norm_mul_f32_cuda(rms_norm_src, mul_src,add_src,dst_d,
                           ne00,ne01, ne02, ne03,
                           /*s00*/ s01, s02, s03,
                           /*mul_s00*/ mul_s01, mul_s02, mul_s03,
                           mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
                           /*add_s00*/ add_s01, add_s02, add_s03,
                           add_ncols, add_nrows, add_nchannels, add_nsamples,
-                          eps, stream);
+                          eps, stream, q8_1);
+
+    if (q8_1_src1 != nullptr) {
+        if (quantized) {
+            ctx.q8_1_cache.set(q8_1_src1, q_args, add_tensor);
+        } else {
+            ctx.q8_1_cache.clear();
+        }
+    }
 }
 
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
