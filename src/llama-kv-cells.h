@@ -496,6 +496,11 @@ public:
         return pos[i];
     }
 
+    // the positions of all the cells, -1 for an empty cell
+    const llama_pos * pos_data() const {
+        return pos.data();
+    }
+
     const llama_kv_cell_ext & ext_get(uint32_t i) const {
         assert(i < pos.size());
         assert(pos[i] != -1);
