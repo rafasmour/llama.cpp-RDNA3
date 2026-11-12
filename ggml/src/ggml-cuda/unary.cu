@@ -797,6 +797,9 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
         case GGML_UNARY_OP_SILU:
             ggml_cuda_op_unary_mul_impl<op_silu>(ctx, unary_node, mul_node, q8_1_src1);
             break;
+        case GGML_UNARY_OP_GELU:
+            ggml_cuda_op_unary_mul_impl<op_gelu>(ctx, unary_node, mul_node, q8_1_src1);
+            break;
         case GGML_UNARY_OP_SIGMOID:
             ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node, q8_1_src1);
             break;
