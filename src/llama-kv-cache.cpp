@@ -1804,6 +1804,37 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
                 }
             }
 
+            // every used cell of the stream holds this sequence: the mask of its first token follows from the positions alone
+            if (!alibi && !swa && !prev && rows == nullptr && cells.seq_pos_get(seq_id).size() == cells.get_used()) {
+                const llama_pos * pos = cells.pos_data();
+
+                // an empty cell has the position -1, which is above every position as an unsigned value
+                const uint32_t p_max = causal ? (uint32_t) p1 : (uint32_t) INT32_MAX;
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    data[idst + j] = (uint32_t) pos[j] <= p_max ? mask_keep : mask_drop;
+                }
+
+                const auto & seq_pos = cells.seq_pos_get(seq_id);
+
+                // the cells that the other tokens of the sequence check again
+                for (auto it = seq_pos.lower_bound({ seq_pos_min[seq_id] - (llama_pos) (n_swa + 32), 0 }); it != seq_pos.end(); ++it) {
+                    if (it->second < n_kv) {
+                        idxs.push_back(it->second);
+                    }
+                }
+
+                // M-RoPE causal mask
+                if (causal && is_2d) {
+                    for (auto it = seq_pos.lower_bound({ p1, 0 }); it != seq_pos.end() && it->first == p1; ++it) {
+                        if (it->second < n_kv && cells.ext_get(it->second).is_2d_gt(p1_x, p1_y)) {
+                            data[idst + it->second] = mask_drop;
+                        }
+                    }
+                }
+
+                continue;
+            }
+
             for (uint32_t jj = 0; jj < n_kv; ++jj) {
                 // column of the mask
                 uint32_t c = jj;
