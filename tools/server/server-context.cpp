@@ -3948,6 +3948,14 @@ private:
             }
         });
 
+        // drafts of different lengths are not verified in one batch, so with several drafting slots
+        // the drafts are not cut short by the minimum probability
+        if (drafting.size() > 1) {
+            for (auto * slot : drafting) {
+                common_speculative_get_draft_params(spec.get(), slot->id).p_min = 0.0f;
+            }
+        }
+
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {

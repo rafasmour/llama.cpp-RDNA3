@@ -174,6 +174,11 @@ using common_speculative_draft_params_vec = std::vector<common_speculative_draft
 //
 // each implementation has a unique type and a state that is implementation-specific
 // in a subclass of common_speculative_impl
+// the minimum probability of the draft tokens of a sequence
+static float common_speculative_p_min(const common_speculative_draft_params & dp, float p_min) {
+    return dp.p_min >= 0.0f ? dp.p_min : p_min;
+}
+
 struct common_speculative_impl {
     const common_speculative_type type;
 
@@ -418,7 +423,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < common_speculative_p_min(dparams.at(seq_id), params.p_min)) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -868,7 +873,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 // only collect very high-confidence draft tokens
                 // (configurable via --spec-draft-p-min, set to 0.0 to disable early-stop)
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < common_speculative_p_min(dparams.at(seq_id), params.p_min)) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1373,6 +1378,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             auto & dp = dparams[seq_id];
 
+            const float p_min = common_speculative_p_min(dp, params.p_min);
+
             const int32_t beg            = i_block_beg[seq_id];
             const int32_t n_block_tokens = n_block[seq_id];
 
@@ -1408,7 +1415,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + top_k));
-                    if (params.p_min > 0.0f || sample) {
+                    if (p_min > 0.0f || sample) {
                         // softmax(scores / temp) at the argmax, i.e. 1 / sum(exp((s_k - s_max) / temp))
                         probs.resize(top_k);
                         float sum = 0.0f;
@@ -1416,7 +1423,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             probs[k] = std::exp((scores[k] - scores[predecessor]) / temp);
                             sum += probs[k];
                         }
-                        if (1.0f / sum < params.p_min) {
+                        if (1.0f / sum < p_min) {
                             break;
                         }
                         for (int32_t k = 0; k < top_k; ++k) {
@@ -1461,13 +1468,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (is_dspark) {
                 // DSpark: read from the first draft slot, truncate below the confidence threshold
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                const float * conf = p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                    if (conf && conf[(size_t) idx * n_embd_dec] < p_min) {
                         break;
                     }
 
@@ -1502,7 +1509,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     const llama_token id = cur_p->data[0].id;
 
-                    if (cur_p->data[0].p < params.p_min) {
+                    if (cur_p->data[0].p < p_min) {
                         break;
                     }
 
@@ -1938,7 +1945,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < common_speculative_p_min(dparams.at(seq_id), params.p_min)) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
