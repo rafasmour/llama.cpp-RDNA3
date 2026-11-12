@@ -699,29 +699,31 @@ static __global__ void mul_mat_vec_q(
     }
 
 
-    [[maybe_unused]] float x_biases[ncols_dst]    = { 0.0f };
-    [[maybe_unused]] float gate_biases[ncols_dst] = { 0.0f };
+    // Each lane of the first warp finishes one element of the block: lane = column*rows_per_cuda_block + row.
+    // The fused bias/activation/GLU code is then run once for all elements instead of once per element.
+    static_assert(!has_fusion || ncols_dst*rows_per_cuda_block <= warp_size, "one lane per fused output element");
+    [[maybe_unused]] const uint32_t lane_col = threadIdx.x / rows_per_cuda_block;
+    [[maybe_unused]] const uint32_t lane_row = threadIdx.x % rows_per_cuda_block;
+    [[maybe_unused]] const bool lane_out = threadIdx.y == 0 && lane_col < ncols_dst &&
+        (rows_per_cuda_block == 1 || uint32_t(row0 + lane_row) < stride_col_dst);
+
+    [[maybe_unused]] float x_bias_lane    = 0.0f;
+    [[maybe_unused]] float gate_bias_lane = 0.0f;
     [[maybe_unused]] float x_scales = 1.0f;
     [[maybe_unused]] float gate_scales = 1.0f;
     if constexpr (has_fusion) {
         // 1. Hide latency by prefetching bias, gates and scales here
         // 2. load only on threads that won't die after partial sum calculation
         const uint32_t channel_bias = ids ? channel_x : channel_dst;
-        if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
-            (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+        if (lane_out) {
             if (use_bias) {
                 x_bias = x_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
-#pragma unroll
-                for (int j = 0; j < ncols_dst; ++j) {
-                    x_biases[j] = x_bias[j * stride_col_dst + threadIdx.x];
-                }
+                const uint32_t stride_col_bias = fusion.x_bias_row ? 0 : stride_col_dst;
+                x_bias_lane = x_bias[lane_col * stride_col_bias + lane_row];
             }
             if (use_gate_bias) {
                 gate_bias = gate_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
-#pragma unroll
-                for (int j = 0; j < ncols_dst; ++j) {
-                    gate_biases[j] = gate_bias[j * stride_col_dst + threadIdx.x];
-                }
+                gate_bias_lane = gate_bias[lane_col * stride_col_dst + lane_row];
             }
             if constexpr (type == GGML_TYPE_NVFP4) {
                 if (use_scale) {
@@ -842,40 +844,66 @@ static __global__ void mul_mat_vec_q(
                 }
             }
 
-            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
-                float result = tmp[j][i];
-                if constexpr (has_fusion) {
-                    if constexpr (type == GGML_TYPE_NVFP4) {
-                        result *= x_scales;
-                    }
-                    result += x_biases[j];
+            if constexpr (!has_fusion) {
+                if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+                    dst[j*stride_col_dst + i] = tmp[j][i];
+                }
+            }
+        }
+    }
+
+    if constexpr (has_fusion) {
+        if (lane_out) {
+            // every lane holds all the sums after the reductions: pick the one of this lane's element
+            float result = 0.0f;
+            float gate_value = 0.0f;
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    const bool sel = threadIdx.x == uint32_t(j*rows_per_cuda_block + i);
+                    result = sel ? tmp[j][i] : result;
                     if (use_gate) {
-                        float gate_value = tmp_gate[j][i];
-                        if constexpr (type == GGML_TYPE_NVFP4) {
-                            gate_value *= gate_scales;
-                        }
-                        gate_value += gate_biases[j];
-                        switch (active_glu) {
-                            case GGML_GLU_OP_SWIGLU:
-                                result *= ggml_cuda_op_silu_single(gate_value);
-                                break;
-                            case GGML_GLU_OP_GEGLU:
-                                result *= ggml_cuda_op_gelu_single(gate_value);
-                                break;
-                            case GGML_GLU_OP_SWIGLU_OAI:
-                                result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
-                                break;
-                            case GGML_GLU_OP_SWIGLU_CLAMP:
-                                result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit);
-                                break;
-                            default:
-                                result = result * gate_value;
-                                break;
-                        }
+                        gate_value = sel ? tmp_gate[j][i] : gate_value;
                     }
                 }
-                dst[j*stride_col_dst + i] = result;
             }
+
+            if constexpr (type == GGML_TYPE_NVFP4) {
+                result *= x_scales;
+            }
+            result += x_bias_lane;
+            if (use_gate) {
+                if constexpr (type == GGML_TYPE_NVFP4) {
+                    gate_value *= gate_scales;
+                }
+                gate_value += gate_bias_lane;
+                switch (active_glu) {
+                    case GGML_GLU_OP_SWIGLU:
+                        result *= ggml_cuda_op_silu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_GEGLU:
+                        result *= ggml_cuda_op_gelu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_SWIGLU_OAI:
+                        result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                        break;
+                    case GGML_GLU_OP_SWIGLU_CLAMP:
+                        result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit);
+                        break;
+                    default:
+                        result = result * gate_value;
+                        break;
+                }
+            } else if (fusion.unary_op != GGML_UNARY_OP_COUNT) {
+                // activation of a gate without GLU; kept off the GLU path, which is the hot one
+                result = fusion.unary_op == GGML_UNARY_OP_SIGMOID ? ggml_cuda_op_sigmoid_single(result)
+                                                                  : ggml_cuda_op_softplus_single(result);
+                if (fusion.unary_mul) {
+                    result *= ((const float *) fusion.unary_mul)[row0 + lane_row];
+                }
+            }
+            dst[lane_col*stride_col_dst + lane_row] = result;
         }
     }
 
@@ -1068,7 +1096,7 @@ static void mul_mat_vec_q_switch_fusion(
         const uint32_t ids_stride, cudaStream_t stream) {
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.unary_op != GGML_UNARY_OP_COUNT;
     if (has_fusion) {
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
         ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
@@ -1542,6 +1570,23 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(ggml_is_contiguous(fusion->gate_scale));
             GGML_ASSERT(ggml_nelements(fusion->gate_scale) == (ids ? src0->ne[2] : 1));
             fusion_local.gate_scale = fusion->gate_scale->data;
+        }
+        if (fusion->unary_op != GGML_UNARY_OP_COUNT) {
+            GGML_ASSERT(!ids && !fusion->gate && !fusion->shared_up);
+            GGML_ASSERT(fusion->unary_op == GGML_UNARY_OP_SIGMOID || fusion->unary_op == GGML_UNARY_OP_SOFTPLUS);
+            fusion_local.unary_op = fusion->unary_op;
+        }
+        if (fusion->unary_mul) {
+            GGML_ASSERT(fusion->unary_op != GGML_UNARY_OP_COUNT && ne2 == 1 && ne3 == 1);
+            GGML_ASSERT(fusion->unary_mul->type == GGML_TYPE_F32);
+            GGML_ASSERT(ggml_is_contiguous(fusion->unary_mul));
+            GGML_ASSERT(ggml_nelements(fusion->unary_mul) == dst->ne[0]);
+            fusion_local.unary_mul = fusion->unary_mul->data;
+        }
+        // a bias column that is broadcast over the dst columns
+        if (fusion->x_bias && !ids && ne1 > 1 && ggml_nelements(fusion->x_bias) == dst->ne[0]) {
+            GGML_ASSERT(ne2 == 1 && ne3 == 1 && ggml_is_contiguous(fusion->x_bias));
+            fusion_local.x_bias_row = true;
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
