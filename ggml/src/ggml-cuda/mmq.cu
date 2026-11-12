@@ -392,7 +392,7 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
 
-bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
+bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, int64_t ne00, int64_t ne01) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
@@ -489,6 +489,22 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             // https://github.com/ggml-org/llama.cpp/pull/18202
             if (n_experts >= 64) {
                 return true;
+            }
+
+            // RX 7900 XT, measured with the weight matrix of a MUL_MAT known (ne00 columns, ne01 rows):
+            //   - a matrix with few rows (the delta-net gates of a GGUF that quantizes them) costs about 0.1 ms more per
+            //     call in MMQ than as a dequantized F16 gemm, at every batch size (prompt speed +2% with 32 to 64
+            //     columns, +7% with 128)
+            //   - for Q4_K with 4096 or more columns per row the F16 gemm on the dequantized weights is faster from a
+            //     batch of 256 (prompt speed of a 9B model +6% with 512 columns, +9% with 1024). Narrower Q5_K
+            //     matrices lose 1.5%, IQ2/IQ3 gain under 2% and stay on MMQ.
+            if (GGML_CUDA_CC_IS_RDNA3_0(cc) && ne01 > 0) {
+                if (ne01 <= 64) {
+                    return false;
+                }
+                if (type == GGML_TYPE_Q4_K && ne11 >= 256 && ne00 >= 4096) {
+                    return false;
+                }
             }
 
             // For some quantization types MMQ can have lower peak TOPS than hipBLAS
