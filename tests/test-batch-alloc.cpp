@@ -685,6 +685,43 @@ static void test_split(testing & t) {
         t.assert_equal(1, ub.seq_idx[1]);
     });
 
+    t.test("split_equal_seq_step", [&](testing & t) {
+        // one token for each of the sequences
+        auto make = [&](batch_builder & bb, std::initializer_list<llama_seq_id> seqs) {
+            for (llama_seq_id s : seqs) {
+                bb.add(0, {s}, true);
+            }
+        };
+        // the sequence ids of the ubatches of a sequential split
+        auto split = [&](testing & t, std::initializer_list<llama_seq_id> seqs, bool seq_step) {
+            batch_builder bb(2, nullptr, 8);
+            make(bb, seqs);
+
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.b, vocab, false));
+
+            std::vector<std::vector<llama_seq_id>> res;
+            while (true) {
+                llama_ubatch ub = ba.split_equal(8, true, 0, seq_step);
+                if (ub.n_tokens == 0) {
+                    break;
+                }
+                t.assert_true(ub.equal_seqs());
+                res.emplace_back(ub.seq_id_unq, ub.seq_id_unq + ub.n_seqs_unq);
+            }
+            t.assert_equal((uint32_t) seqs.size(), ba.get_n_used());
+            return res;
+        };
+        using sets = std::vector<std::vector<llama_seq_id>>;
+
+        t.assert_true("consecutive ids only without the step",      split(t, {0, 2, 4, 5}, false) == sets{{0}, {2}, {4, 5}});
+        t.assert_true("evenly spaced ids share a ubatch",           split(t, {0, 2, 4, 5}, true)  == sets{{0, 2, 4}, {5}});
+        t.assert_true("any step",                                   split(t, {0, 3, 6},    true)  == sets{{0, 3, 6}});
+        t.assert_true("the second sequence sets the step",          split(t, {0, 1, 3},    true)  == sets{{0, 1}, {3}});
+        t.assert_true("consecutive ids are a step of one",          split(t, {1, 2, 3},    true)  == sets{{1, 2, 3}});
+        t.assert_true("the rest is split with its own step",        split(t, {0, 2, 3, 5}, true)  == sets{{0, 2}, {3, 5}});
+    });
+
     t.test("split_seq_per_sequence", [&](testing & t) {
         batch_builder bb;
         for (llama_seq_id s = 0; s < 3; ++s) {
