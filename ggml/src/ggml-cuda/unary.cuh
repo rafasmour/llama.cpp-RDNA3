@@ -91,7 +91,9 @@ void ggml_cuda_op_geglu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
+// q8_1_src1: the src1 of the quantized mat-vec that reads the result next, to also write its q8_1 copy (q8_1 cache)
+void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node,
+                            const ggml_tensor * q8_1_src1 = nullptr);
 
 void ggml_cuda_op_sigmoid_gate_add(
         ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * shexp,

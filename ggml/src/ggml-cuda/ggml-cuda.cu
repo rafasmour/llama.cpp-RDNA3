@@ -2276,10 +2276,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(
 // The src1 of the quantized mat-vec that reads the output of node out_idx, when that mat-vec is the next one to use the
 // q8_1 cache: the kernel that writes the output can then write the q8_1 copy as well, which saves the quantize launch.
 // A wrong guess only costs the copy, ggml_cuda_mul_mat_vec_q checks the cache key.
-static const ggml_tensor * ggml_cuda_q8_1_consumer(const ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int out_idx) {
+// same_rows: the writer works on rows, so the mat-vec has to see the same row length
+static const ggml_tensor * ggml_cuda_q8_1_consumer(const ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int out_idx,
+                                                   const bool same_rows = true) {
     const ggml_tensor * out = cgraph->nodes[out_idx];
-    if (cuda_ctx->curr_stream_no != 0 || out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) ||
-            out->ne[0] % MATRIX_ROW_PADDING != 0) {
+    if (cuda_ctx->curr_stream_no != 0 || out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out)) {
         return nullptr;
     }
     const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
@@ -2299,8 +2300,8 @@ static const ggml_tensor * ggml_cuda_q8_1_consumer(const ggml_backend_cuda_conte
                                        ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                        src0->view_src;
         if (!mmvq || bad_padding_clear || src1->data != out->data || src1->type != GGML_TYPE_F32 || n->type != GGML_TYPE_F32 ||
-                !ggml_is_contiguous(src1) || src1->ne[0] != out->ne[0] || ggml_nelements(src1) != ggml_nelements(out) ||
-                (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                !ggml_is_contiguous(src1) || src1->ne[0] % MATRIX_ROW_PADDING != 0 || (same_rows && src1->ne[0] != out->ne[0]) ||
+                ggml_nelements(src1) != ggml_nelements(out) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             return nullptr;
         }
         return src1;
@@ -5250,7 +5251,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-        ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1], ggml_cuda_q8_1_consumer(cuda_ctx, cgraph, i + 1, false));
         return 1;
     }
 
