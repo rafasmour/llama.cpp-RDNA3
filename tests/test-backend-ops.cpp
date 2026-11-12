@@ -8335,6 +8335,48 @@ struct test_rms_norm_mul_mat : public test_case {
     }
 };
 
+// unary + mul (the output gate of an attention or delta-net block) followed by a mat-mul with quantized weights:
+// backends may quantize the activations in the gate kernel
+struct test_unary_mul_mul_mat : public test_case {
+    const ggml_type type_a;
+    const ggml_unary_op op;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int64_t heads; // > 1: the gate works on [k/heads, heads, n] and the mat-mul reads it reshaped to [k, n]
+
+    test_unary_mul_mul_mat(ggml_type type_a, ggml_unary_op op, int64_t m, int64_t n, int64_t k, int64_t heads)
+        : type_a(type_a), op(op), m(m), n(n), k(k), heads(heads) {}
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, op, m, n, k, heads);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "UNARY_MUL_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k / heads, heads, n);
+        ggml_tensor * g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k / heads, heads, n);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+
+        ggml_tensor * cur = ggml_mul(ctx, x, ggml_unary(ctx, g, op));
+        cur = ggml_reshape_2d(ctx, cur, k, n);
+        ggml_tensor * out = ggml_mul_mat(ctx, a, cur);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // mul_mat followed by an add of a residual, which backends may fuse into the mat-mul
 struct test_mul_mat_add : public test_case {
     const ggml_type type_a;
@@ -12215,6 +12257,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int mode : {1, 2, 3}) {
             for (int64_t n : {1, 5}) {
                 test_cases.emplace_back(new test_rms_norm_mul_mat(type_a, 33, n, 1024, mode));
+            }
+        }
+    }
+    // output gate of a block followed by the quantized output projection
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (ggml_unary_op op : {GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID}) {
+            for (int64_t k : {256, 512, 768, 4096}) {
+                for (int64_t n : {1, 5, 9}) {
+                    test_cases.emplace_back(new test_unary_mul_mul_mat(type_a, op, 33, n, k, 1));
+                    test_cases.emplace_back(new test_unary_mul_mul_mat(type_a, op, 33, n, k, 8));
+                }
             }
         }
     }
