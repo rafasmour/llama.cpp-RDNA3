@@ -410,7 +410,8 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
                 inp_this_layer = ggml_get_rows(ctx0, inp_this_layer, inp_out_ids);
             }
 
-            cur = ggml_mul(ctx0, cur, inp_this_layer);
+            // the slice goes first so that its nodes come before the gate: gelu + mul are then adjacent and can be fused
+            cur = ggml_mul(ctx0, inp_this_layer, cur);
             cur = build_lora_mm(model.layers[il].per_layer_proj, cur); // [n_embd, n_rows]
             cur = build_norm(cur, model.layers[il].per_layer_post_norm, nullptr, LLM_NORM_RMS, il);
             cb(cur, "per_layer_embd_out", il);

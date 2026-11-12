@@ -8289,7 +8289,8 @@ struct test_rms_norm_mul_mat : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
-    const int mode; // 0: one mat-mul, 1: two mat-muls of the norm, 2: a float mat-mul first, 3: the norm is overwritten in between
+    const int mode; // 0: one mat-mul, 1: two mat-muls of the norm, 2: a float mat-mul first, 3: the norm is overwritten in between,
+                    // 4: a residual is added to the norm (in place, as the allocator does), 5: the same with a mat-mul of the residual later
 
     test_rms_norm_mul_mat(ggml_type type_a, int64_t m, int64_t n, int64_t k, int mode)
         : type_a(type_a), m(m), n(n), k(k), mode(mode) {}
@@ -8326,6 +8327,13 @@ struct test_rms_norm_mul_mat : public test_case {
             ggml_tensor * first = ggml_mul_mat(ctx, a, cur);
             ggml_tensor * cur2  = ggml_scale_inplace(ctx, cur, 0.5f);
             out = ggml_add(ctx, first, ggml_mul_mat(ctx, a, cur2));
+        } else if (mode == 4 || mode == 5) {
+            ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_tensor * sum = ggml_add_inplace(ctx, cur, res);
+            out = ggml_mul_mat(ctx, a, sum);
+            if (mode == 5) {
+                out = ggml_add(ctx, out, ggml_mul_mat(ctx, a, res));
+            }
         } else {
             out = ggml_mul_mat(ctx, a, cur);
         }
@@ -12314,7 +12322,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_rms_norm_mul_mat(type_a, 33, n, k, 0));
             }
         }
-        for (int mode : {1, 2, 3}) {
+        for (int mode : {1, 2, 3, 4, 5}) {
             for (int64_t n : {1, 5}) {
                 test_cases.emplace_back(new test_rms_norm_mul_mat(type_a, 33, n, 1024, mode));
             }
