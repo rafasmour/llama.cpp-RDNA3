@@ -1505,6 +1505,7 @@ struct ggml_cuda_mm_fusion_args_device {
     uint32_t shared_stride_col_dst = 0;
     ggml_unary_op unary_op = GGML_UNARY_OP_COUNT;
     const void * unary_mul = nullptr;
+    bool x_bias_row = false; // x_bias is one column that is added to every dst column
 };
 
 struct ggml_cuda_kernel_launch_params {
