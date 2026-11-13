@@ -2386,8 +2386,10 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     if (input->op != GGML_OP_RESHAPE || input->src[0] != shared_up->src[1] ||
             input->ne[1] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input) ||
             !ggml_is_contiguous(shared_up->src[1]) || !ggml_is_matrix(shared_up->src[1]) ||
-            weight->type != shared_weight->type || weight->ne[0] != shared_weight->ne[0] ||
-            weight->ne[1] != shared_weight->ne[1] || weight->nb[1] != shared_weight->nb[1] || weight->ne[3] != 1 ||
+            !(weight->type == shared_weight->type ? weight->nb[1] == shared_weight->nb[1] :
+                ggml_cuda_mmvq_mixed_shared_expert(weight->type, shared_weight->type, ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) ||
+            shared_gate->src[0]->type != shared_weight->type ||
+            weight->ne[0] != shared_weight->ne[0] || weight->ne[1] != shared_weight->ne[1] || weight->ne[3] != 1 ||
             !ggml_is_matrix(shared_weight) || !ggml_is_contiguous(shared_weight) ||
             !ggml_is_contiguous(shared_gate->src[0]) || !ggml_is_contiguous(routed) || !ggml_is_contiguous(shared)) {
         return false;
@@ -4526,7 +4528,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
-            ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
+            ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1]) &&
+            // a shared expert of another type has its kernel for one token only
+            (cgraph->nodes[i + 2]->src[1]->src[0]->type == cgraph->nodes[i + 5]->src[1]->src[0]->type || cgraph->nodes[i + 2]->ne[2] == 1)) {
         const int outputs[] = { i + 2, i + 5 };
         if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, outputs, 2)) {
             ggml_tensor * routed = cgraph->nodes[i + 2];
