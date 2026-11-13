@@ -4601,7 +4601,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_FLASH_ATTN_EXT) {
         // no fusion: the node itself can write the q8_1 copy of its result
-        cuda_ctx->fattn_q8_1_src1 = ggml_cuda_q8_1_consumer(cuda_ctx, cgraph, i, false);
+        cuda_ctx->node_q8_1_src1 = ggml_cuda_q8_1_consumer(cuda_ctx, cgraph, i, false);
         return 0;
     }
 
@@ -5634,6 +5634,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // not fused: the kernel of a MUL of rows with one factor per row can write the q8_1 copy of its result
+    if (node->op == GGML_OP_MUL && ggml_cuda_can_mul_row_factor_q8_1(node)) {
+        cuda_ctx->node_q8_1_src1 = ggml_cuda_q8_1_consumer(cuda_ctx, cgraph, i, false, true);
+    }
+
     return 0;
 }
 
@@ -5844,6 +5849,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                cuda_ctx->node_q8_1_src1 = nullptr;
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
