@@ -850,6 +850,89 @@ void ggml_cuda_op_sigmoid_gate_add(
         (int64_t) (moe->nb[1] / sizeof(float)), (int64_t) (res->nb[1] / sizeof(float)));
 }
 
+/* sigmoid_gate_add with the gate computed by the same kernel: gate = dot(w, x) for each dst row
+   every block sums the dot product like mul_mat_vec_f does, with the same block size, so the gate value is the same */
+
+static __global__ void dot_sigmoid_gate_add_kernel(
+        const float * w, const float * x, const float * shexp, const float * moe, const float * res, float * dst,
+        const int ncols2, const int64_t nc, const int64_t x_stride, const int64_t shexp_stride,
+        const int64_t moe_stride, const int64_t res_stride) {
+    ggml_cuda_pdl_lc();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int     block_size = blockDim.x;
+    const int     tid = threadIdx.x;
+    const int64_t row = blockIdx.y;
+    const int64_t col = int64_t(block_size)*blockIdx.x + tid;
+
+    __shared__ float buf_iw[warp_size];
+    if (block_size > warp_size) {
+        if (tid < warp_size) {
+            buf_iw[tid] = 0.0f;
+        }
+        __syncthreads();
+    }
+
+    ggml_cuda_pdl_sync();
+    const float2 * w2 = (const float2 *) w;
+    const float2 * x2 = (const float2 *) (x + row*x_stride);
+
+    float sumf = 0.0f;
+    for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        const float2 tmpw = w2[col2];
+        const float2 tmpx = x2[col2];
+        ggml_cuda_mad(sumf, tmpw.x, tmpx.x);
+        ggml_cuda_mad(sumf, tmpw.y, tmpx.y);
+    }
+
+    sumf = warp_reduce_sum<warp_size>(sumf);
+    if (block_size > warp_size) {
+        buf_iw[tid/warp_size] = sumf;
+        __syncthreads();
+        // every warp reduces the sums of all warps, mul_mat_vec_f does this in its first warp
+        sumf = buf_iw[tid % warp_size];
+        sumf = warp_reduce_sum<warp_size>(sumf);
+    }
+
+    if (col >= nc) {
+        return;
+    }
+
+    const float gated = shexp[row*shexp_stride + col] * op_sigmoid(sumf);
+    dst[row*nc + col] = moe[row*moe_stride + col] + gated + res[row*res_stride + col];
+}
+
+void ggml_cuda_op_dot_sigmoid_gate_add(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, const ggml_tensor * shexp,
+        const ggml_tensor * moe, const ggml_tensor * res, ggml_tensor * dst) {
+    GGML_ASSERT(w->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && shexp->type == GGML_TYPE_F32 &&
+                moe->type == GGML_TYPE_F32 && res->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->ne[0] == x->ne[0] && w->ne[0] % 2 == 0 && x->ne[1] == dst->ne[1]);
+
+    const int64_t ncols     = w->ne[0];
+    const int64_t nc        = dst->ne[0];
+    const int     warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+    // the block size of launch_mul_mat_vec_f_cuda for this row length
+    int64_t block_size_best = warp_size;
+    int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
+    for (int64_t block_size = 2*warp_size; block_size <= 256; block_size += warp_size) {
+        const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
+        if (niter < niter_best) {
+            niter_best      = niter;
+            block_size_best = block_size;
+        }
+    }
+
+    const dim3 block_nums((nc + block_size_best - 1) / block_size_best, dst->ne[1], 1);
+    const dim3 block_dims(block_size_best, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, ctx.stream());
+    ggml_cuda_kernel_launch(dot_sigmoid_gate_add_kernel, launch_params,
+        (const float *) w->data, (const float *) x->data, (const float *) shexp->data, (const float *) moe->data,
+        (const float *) res->data, (float *) dst->data, (int) (ncols/2), nc,
+        (int64_t) (x->nb[1] / sizeof(float)), (int64_t) (shexp->nb[1] / sizeof(float)),
+        (int64_t) (moe->nb[1] / sizeof(float)), (int64_t) (res->nb[1] / sizeof(float)));
+}
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {

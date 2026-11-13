@@ -4467,6 +4467,54 @@ static bool ggml_cuda_match_sigmoid_gate_add(
     return !overlaps(gate, dst);
 }
 
+// mul_mat with one F32 weight row -> the chain of ggml_cuda_match_sigmoid_gate_add: the tail kernel computes the gate
+static bool ggml_cuda_match_dot_sigmoid_gate_add(
+        const ggml_cgraph * cgraph, int node_idx,
+        const ggml_tensor *& shexp, const ggml_tensor *& moe, const ggml_tensor *& res) {
+    const ggml_tensor * mm = cgraph->nodes[node_idx];
+    if (mm->op != GGML_OP_MUL_MAT || node_idx + 4 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    if (!GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+        return false;
+    }
+
+    const int output_idx = node_idx + 4;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx,
+            { GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD }, { output_idx })) {
+        return false;
+    }
+
+    const ggml_tensor * gate;
+    if (!ggml_cuda_match_sigmoid_gate_add(cgraph, node_idx + 1, gate, shexp, moe, res) || gate != mm) {
+        return false;
+    }
+
+    const ggml_tensor * w   = mm->src[0];
+    const ggml_tensor * x   = mm->src[1];
+    const ggml_tensor * dst = cgraph->nodes[output_idx];
+
+    // only where the mul_mat would run in mul_mat_vec_f, the kernel sums the dot product in its order
+    if (w->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+            w->ne[0] != x->ne[0] || w->ne[1] != 1 || w->ne[2] != 1 || w->ne[3] != 1 || !ggml_is_contiguous(w) ||
+            x->ne[1] != dst->ne[1] || x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != sizeof(float) ||
+            x->nb[1] % (2*sizeof(float)) != 0 || !ggml_cuda_is_aligned(x, 2*sizeof(float)) ||
+            ggml_prec_get_acc(mm) != GGML_PREC_UNDEFINED || !ggml_cuda_should_use_mmvf(w, cc, warp_size, x->ne[1])) {
+        return false;
+    }
+
+    // every block reads w and all of its x row while other blocks write
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    return !overlaps(w, dst) && !overlaps(x, dst);
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5179,6 +5227,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    {
+        const ggml_tensor * shexp;
+        const ggml_tensor * moe;
+        const ggml_tensor * res;
+        if (ggml_cuda_match_dot_sigmoid_gate_add(cgraph, i, shexp, moe, res)) {
+            ggml_cuda_op_dot_sigmoid_gate_add(*cuda_ctx, node->src[0], node->src[1], shexp, moe, res, cgraph->nodes[i + 4]);
+            return 4;
+        }
     }
 
     // mul_mat + unary (sigmoid), or mul_mat + add + unary (softplus) + mul

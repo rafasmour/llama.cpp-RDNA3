@@ -4566,7 +4566,17 @@ struct test_shared_expert_tail : public test_case {
         : ne(ne), tail(std::move(tail)) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * logit = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, ne[1]);
+        ggml_tensor * logit;
+        if (tail == "gate_mm") {
+            // the gate comes from a mul_mat with one weight row, as in the model graph
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], 1);
+            ggml_set_name(w, "w");
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+            ggml_set_name(x, "x");
+            logit = ggml_mul_mat(ctx, w, x);
+        } else {
+            logit = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, ne[1]);
+        }
         ggml_set_name(logit, "logit");
         ggml_tensor * shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
         ggml_set_name(shexp, "shexp");
@@ -4580,8 +4590,8 @@ struct test_shared_expert_tail : public test_case {
         ggml_tensor * sum   = tail == "swapped" ? ggml_add(ctx, gated, moe) : ggml_add(ctx, moe, gated);
         ggml_tensor * out   = tail == "swapped" ? ggml_add(ctx, res, sum)   : ggml_add(ctx, sum, res);
 
-        if (tail == "swapped") {
-            // operand order of the adds does not matter
+        if (tail == "swapped" || tail == "gate_mm") {
+            // operand order of the adds does not matter; the gate mul_mat joins the fused kernel for up to 8 tokens
         } else if (tail == "mul_in_last_add") {
             // the first add does not take the gated output, so the chain must not fuse
             out = ggml_add(ctx, ggml_add(ctx, moe, res), gated);
@@ -10991,6 +11001,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_shared_expert_tail({ 2048, 7 }, "reuse_sum"));
     test_cases.emplace_back(new test_shared_expert_tail({ 2048, 7 }, "swapped"));
     test_cases.emplace_back(new test_shared_expert_tail({ 2048, 7 }, "mul_in_last_add"));
+    for (std::array<int64_t, 2> ne : { std::array<int64_t, 2>{ 2048, 1 }, { 2048, 7 }, { 2048, 12 }, { 96, 5 }, { 33, 5 } }) {
+        test_cases.emplace_back(new test_shared_expert_tail(ne, "gate_mm"));
+    }
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
