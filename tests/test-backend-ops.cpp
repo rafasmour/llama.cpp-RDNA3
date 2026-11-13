@@ -8434,6 +8434,60 @@ struct test_unary_mul_mul_mat : public test_case {
     }
 };
 
+// flash attention followed by a mat-mul with quantized weights (the output projection):
+// backends may quantize the activations in the attention kernel
+struct test_flash_attn_mul_mat : public test_case {
+    const ggml_type type_a;
+    const int64_t hs; // head size
+    const int64_t nh; // num heads
+    const int64_t kv; // kv size
+    const int64_t nb; // batch size
+
+    test_flash_attn_mul_mat(ggml_type type_a, int64_t hs, int64_t nh, int64_t kv, int64_t nb)
+        : type_a(type_a), hs(hs), nh(nh), kv(kv), nb(nb) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, hs, nh, kv, nb);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FLASH_ATTN_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(m, "m");
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, hs*nh, 33);
+
+        ggml_tensor * cur = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        cur = ggml_reshape_2d(ctx, cur, hs*nh, nb);
+        ggml_tensor * out = ggml_mul_mat(ctx, a, cur);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // The conv state of a recurrent layer: the new input is appended to the state columns (concat along dim 0)
 // and the last columns of the result are copied back into the state, which backends may do in one pass.
 struct test_concat_state_store : public test_case {
@@ -12419,6 +12473,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q4_K, 16, 2, 16384, 0));
     test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q4_K, 16, 2, 16384 + 512, 0));
+
+    // attention followed by the quantized output projection: head sizes of whole q8_1 blocks, short and long KV,
+    // mat-vec (<= 8 tokens) and mat-mul, a row length that needs padding of the q8_1 copy and a head size without whole blocks
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+        for (int64_t hs : {64, 128, 256}) {
+            for (int64_t kv : {512, 4096}) {
+                for (int64_t nb : {1, 3, 8, 9}) {
+                    test_cases.emplace_back(new test_flash_attn_mul_mat(type_a, hs, 1024/hs, kv, nb));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_mul_mat(type_a, 128,  6, 4096, 1));
+        test_cases.emplace_back(new test_flash_attn_mul_mat(type_a,  80, 16, 4096, 1));
+    }
 
     // gated delta net gates with quantized weights and with several tokens (speculative verify), odd row count
     for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {

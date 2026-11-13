@@ -4526,6 +4526,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        // no fusion: the node itself can write the q8_1 copy of its result
+        cuda_ctx->fattn_q8_1_src1 = ggml_cuda_q8_1_consumer(cuda_ctx, cgraph, i, false);
+        return 0;
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1]) &&

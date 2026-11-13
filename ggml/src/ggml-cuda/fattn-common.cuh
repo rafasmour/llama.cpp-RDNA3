@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "convert.cuh"
+#include "mmvq.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
@@ -970,13 +971,15 @@ static __global__ void flash_attn_stream_k_fixup_general(
     *dst = dst_val / rowsum;
 }
 
-template<int D> // D == head size
+// do_quantize: also write the result as q8_1 blocks, as quantize_q8_1 would for the mat-vec that reads it
+template<int D, bool do_quantize = false> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_combine_results(
         const float  * VKQ_parts_ptr,
         const float2 * VKQ_meta_ptr,
         float * dst_ptr,
-        const int parallel_blocks) {
+        const int parallel_blocks,
+        block_q8_1 * q8_1 = nullptr) {
     ggml_cuda_pdl_lc();
     const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
     const float2 * GGML_CUDA_RESTRICT VKQ_meta  = VKQ_meta_ptr;
@@ -1025,7 +1028,25 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    const float res = VKQ_numerator / VKQ_denominator;
+    dst[tid] = res;
+
+    if constexpr (do_quantize) {
+        // same arithmetic as quantize_q8_1, each warp holds one block
+        static_assert(D % QK8_1 == 0 && WARP_SIZE == QK8_1, "bad head size");
+        const float  amax = warp_reduce_max<QK8_1>(fabsf(res));
+        const float  d    = amax / 127.0f;
+        const int8_t q    = amax == 0.0f ? 0 : roundf(res / d);
+        const int    sum  = warp_reduce_sum<QK8_1>((int) q);
+
+        block_q8_1 * y = q8_1 + ((int64_t) j_dst_unrolled*D + tid) / QK8_1;
+        y->qs[tid % QK8_1] = q;
+        if (tid % QK8_1 == 0) {
+            y->ds = make_half2(d, d * sum);
+        }
+    } else {
+        GGML_UNUSED(q8_1);
+    }
 }
 
 template <int DV, int ncols1, int ncols2>
@@ -1370,8 +1391,21 @@ void launch_fattn(
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
-        ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+        // The next quantized mat-vec reads the result as q8_1 blocks: write them here, into the cache that it looks up.
+        const ggml_tensor * q8_1_src1 = DV % QK8_1 == 0 && WARP_SIZE == QK8_1 ? ctx.fattn_q8_1_src1 : nullptr;
+        if (q8_1_src1 != nullptr) {
+            GGML_ASSERT(q8_1_src1->data == KQV->data && ggml_nelements(q8_1_src1) == ggml_nelements(KQV));
+            int64_t q_args[8];
+            ggml_cuda_mmvq_q8_1_args(q8_1_src1, q_args);
+            ctx.q8_1_cache.clear();
+            ctx.q8_1_cache.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ggml_nelements(KQV) * sizeof(block_q8_1) / QK8_1);
+            ggml_cuda_kernel_launch(flash_attn_combine_results<DV, DV % QK8_1 == 0 && WARP_SIZE == QK8_1>, launch_params,
+                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, (block_q8_1 *) ctx.q8_1_cache.buf->get());
+            ctx.q8_1_cache.set(q8_1_src1, q_args, KQV);
+        } else {
+            ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
+                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, (block_q8_1 *) nullptr);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }
