@@ -25,7 +25,6 @@
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
 #include "ggml-cuda/cumsum.cuh"
-#include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fp8.cuh"
@@ -34,6 +33,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mmq-few.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -178,6 +178,11 @@ static bool ggml_cuda_fusion_disabled() {
 
 static bool ggml_cuda_p2p_enabled() {
     static const bool enabled = ggml_cuda_env_set("GGML_CUDA_P2P");
+    return enabled;
+}
+
+bool ggml_cuda_pool_debug_enabled() {
+    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_POOL_DEBUG");
     return enabled;
 }
 
@@ -736,9 +741,43 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 };
 #endif // defined(GGML_USE_VMM)
 
+// Debug pool for NVIDIA compute-sanitizer, e.g.
+// `GGML_CUDA_POOL_DEBUG=1 compute-sanitizer --tool memcheck ./build/bin/test-backend-ops -b CUDA0`
+// Allocations are exact-size and freed on release,
+// allowing memcheck to catch out-of-bounds and use-after-free.
+struct ggml_cuda_pool_debug : public ggml_cuda_pool {
+    int device;
+    size_t pool_size = 0;       // leak check (error if not zero at destruction)
+
+    explicit ggml_cuda_pool_debug(int device) :
+        device(device) {
+    }
+
+    ~ggml_cuda_pool_debug() {
+        GGML_ASSERT(pool_size == 0);
+    }
+
+    void * alloc(size_t size, size_t * actual_size) override {
+        void * ptr;
+        CUDA_CHECK(ggml_cuda_device_malloc(&ptr, size, device));
+        *actual_size = size;
+        pool_size += size;
+        return ptr;
+    }
+
+    void free(void * ptr, size_t size) override {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(ptr));
+        pool_size -= size;
+    }
+};
+
 std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(ggml_backend_cuda_context & ctx,
                                                                                int                         device,
                                                                                [[maybe_unused]] int        stream_no) {
+    if (ggml_cuda_pool_debug_enabled()) {
+        return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_debug(device));
+    }
 #if defined(GGML_USE_VMM)
     if (ggml_cuda_info().devices[device].vmm) {
         return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm(device));
@@ -2462,6 +2501,10 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
     const int64_t ncols     = is_id ? y->ne[2]    : y->ne[1];
     const int64_t nchannels = is_id ? x_up->ne[2] : y->ne[2]*y->ne[3];
     const bool    use_mmvq  = is_id ? ncols <= get_mmvq_mmid_max_batch(x_up->type, cc) : ggml_cuda_should_use_mmvq(x_up->type, cc, ncols);
+    // do not fuse the matmuls that few-row MMQ takes in ggml_cuda_mul_mat
+    if (!is_id && ggml_cuda_should_use_mmq_few(x_up, y, cc)) {
+        return false;
+    }
     if (use_mmvq || !ggml_cuda_should_use_mmq(x_up->type, cc, ncols, /*n_experts =*/ is_id ? x_up->ne[2] : 0,
                                               is_id ? 0 : x_up->ne[0], is_id ? 0 : x_up->ne[1])) {
         return false;
@@ -2515,8 +2558,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+    // from a per-type number of src1 columns up to 24, few-row MMQ is faster than MMVQ and MMQ
+    const bool use_mmq_few = ggml_cuda_should_use_mmq_few(src0, src1, cc);
+    if (!use_mmq_few && ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    if (use_mmq_few) {
+        ggml_cuda_mul_mat_q_few(ctx, src0, src1, dst);
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0, ne00, ne01)) {
@@ -2763,7 +2812,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_dup(ctx, dst);
             break;
         case GGML_OP_ADD:
-        case GGML_OP_ADD1: // TODO: more efficient implementation
             ggml_cuda_op_add(ctx, dst);
             break;
         case GGML_OP_ADD_ID:
@@ -2957,9 +3005,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 break;
         case GGML_OP_DIAG:
             ggml_cuda_op_diag(ctx, dst);
-            break;
-        case GGML_OP_DIAG_MASK_INF:
-            ggml_cuda_op_diag_mask_inf(ctx, dst);
             break;
         case GGML_OP_SOFT_MAX:
             ggml_cuda_op_soft_max(ctx, dst);
@@ -3310,7 +3355,54 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(cudaGraphExec_t & instance, cudaGraph_t cuda_graph) {
+#ifdef USE_CUDA_GRAPH_CLUSTER_CHECK
+static std::vector<ggml_cuda_graph_cluster> ggml_cuda_graph_get_clusters(cudaGraph_t cuda_graph, int device) {
+    std::vector<ggml_cuda_graph_cluster> clusters;
+    static const bool runtime_affected = [] {
+        int version = 0;
+        CUDA_CHECK(cudaRuntimeGetVersion(&version));
+        // TODO: upper bound once fixed in the CUDA runtime
+        return version >= 11080;
+    }();
+    if (!runtime_affected || ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_HOPPER) {
+        return clusters;
+    }
+    size_t n_nodes = 0;
+    CUDA_CHECK(cudaGraphGetNodes(cuda_graph, nullptr, &n_nodes));
+    std::vector<cudaGraphNode_t> nodes(n_nodes);
+    CUDA_CHECK(cudaGraphGetNodes(cuda_graph, nodes.data(), &n_nodes));
+    for (size_t i = 0; i < n_nodes; ++i) {
+        cudaGraphNodeType type;
+        CUDA_CHECK(cudaGraphNodeGetType(nodes[i], &type));
+        if (type != cudaGraphNodeTypeKernel) {
+            continue;
+        }
+        cudaLaunchAttributeValue val = {};
+        CUDA_CHECK(cudaGraphKernelNodeGetAttribute(nodes[i], cudaLaunchAttributeClusterDimension, &val));
+        if (val.clusterDim.x * val.clusterDim.y * val.clusterDim.z > 1) {
+            clusters.push_back({ i, val.clusterDim.x, val.clusterDim.y, val.clusterDim.z });
+        }
+    }
+    return clusters;
+}
+#endif // USE_CUDA_GRAPH_CLUSTER_CHECK
+
+static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instance, cudaGraph_t cuda_graph, int device) {
+#ifdef USE_CUDA_GRAPH_CLUSTER_CHECK
+    std::vector<ggml_cuda_graph_cluster> clusters = ggml_cuda_graph_get_clusters(cuda_graph, device);
+    if (instance.clusters != clusters) {
+        if (ggml_cuda_graph_debug_enabled()) {
+            GGML_LOG_DEBUG("%s: cluster dims changed, re-instantiating CUDA graph\n", __func__);
+        }
+        CUDA_CHECK(cudaGraphExecDestroy(instance));
+        CUDA_CHECK(cudaGraphInstantiate(&instance.handle, cuda_graph, nullptr, nullptr, 0));
+        instance.clusters = std::move(clusters);
+        return;
+    }
+#else
+    GGML_UNUSED(device);
+#endif // USE_CUDA_GRAPH_CLUSTER_CHECK
+
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
     cudaError_t stat = cudaGraphExecUpdate(instance, cuda_graph, &result_info);
@@ -3329,8 +3421,8 @@ static void ggml_cuda_graph_update_executable(cudaGraphExec_t & instance, cudaGr
         // so instead clear error and re-instantiate
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(instance));
-        instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&instance, cuda_graph, nullptr, nullptr, 0));
+        instance.handle = nullptr;
+        CUDA_CHECK(cudaGraphInstantiate(&instance.handle, cuda_graph, nullptr, nullptr, 0));
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
@@ -3351,11 +3443,14 @@ static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, g
     CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &cuda_graph));
 
     if (idx < graph->instances.size()) {
-        ggml_cuda_graph_update_executable(graph->instances[idx], cuda_graph);
+        ggml_cuda_graph_update_executable(graph->instances[idx], cuda_graph, cuda_ctx->device);
     } else {
         GGML_ASSERT(idx == graph->instances.size());
-        graph->instances.emplace_back(nullptr);
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instances[idx], cuda_graph, nullptr, nullptr, 0));
+        graph->instances.emplace_back();
+        CUDA_CHECK(cudaGraphInstantiate(&graph->instances[idx].handle, cuda_graph, nullptr, nullptr, 0));
+#ifdef USE_CUDA_GRAPH_CLUSTER_CHECK
+        graph->instances[idx].clusters = ggml_cuda_graph_get_clusters(cuda_graph, cuda_ctx->device);
+#endif // USE_CUDA_GRAPH_CLUSTER_CHECK
     }
     CUDA_CHECK(cudaGraphDestroy(cuda_graph));
 
@@ -5053,6 +5148,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 return 1;
             }
 
+            if (!with_bias && src0->type == GGML_TYPE_NVFP4 && src1->type == GGML_TYPE_F32 && mm_node->type == GGML_TYPE_F32) {
+                const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+                const bool is_id = op == GGML_OP_MUL_MAT_ID;
+                const int64_t ncols = is_id ? src1->ne[2] : src1->ne[1];
+                const bool use_mmvq = is_id ? ncols <= get_mmvq_mmid_max_batch(src0->type, cc) :
+                                            ggml_cuda_should_use_mmvq(src0->type, cc, ncols);
+                const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                                               ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                               src0->view_src;
+                if (!use_mmvq && !bad_padding_clear &&
+                        ggml_cuda_should_use_mmq(src0->type, cc, ncols, /*n_experts =*/ is_id ? src0->ne[2] : 0)) {
+                    fusion_data.prec_src1 = ggml_prec_get_src(mm_node, 1);
+                    ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
+                    return n_ops - 1;
+                }
+            }
+
             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node, out_node, bias)) {
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
                 fused_mul_mat_vec = true;
@@ -6672,7 +6784,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
         case GGML_OP_ADD_ID:
-        case GGML_OP_ADD1:
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
         case GGML_OP_SIN:
@@ -6718,8 +6829,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->ne[1] % 128 == 0;
         }
         case GGML_OP_CONT:
-            return true;
-        case GGML_OP_DIAG_MASK_INF:
             return true;
         case GGML_OP_SOFT_MAX:
             return true;
