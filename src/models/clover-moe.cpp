@@ -329,10 +329,8 @@ ggml_tensor * llama_model_clover_moe::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    // the chunked path without the fused kernel reads the state after the new state is stored
-    ggml_tensor * state = (ubatch.n_seq_tokens == 1 || cparams.fused_gdn_ch) ?
-        build_rs_in_place(inp, ssm_states_all, hparams.n_embd_s(), n_seqs) :
-        build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    // the delta net is always the fused kernel, which reads the state before it stores the new one
+    ggml_tensor * state = build_rs_in_place(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
@@ -356,11 +354,6 @@ ggml_tensor * llama_model_clover_moe::graph::build_layer_attn_linear(
     cb(v_conv, "v_conv", il);
 
     auto [q_conv, k_conv] = build_gdn_l2_norm_qk(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs, 1e-6f);
-
-    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
-        q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
-        k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
-    }
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
