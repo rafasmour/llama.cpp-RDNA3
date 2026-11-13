@@ -4232,13 +4232,26 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return false;
     }
 
-    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
+    if ((ops.size() >= 2 && ops.size() <= 4) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
         const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
         const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
         const ggml_tensor *add      = nullptr;
 
-        if (ops.size() == 3 && ops.begin()[2] == GGML_OP_ADD) {
+        if (ops.size() >= 3 && ops.begin()[2] == GGML_OP_ADD) {
             add = cgraph->nodes[node_idx+2];
+        }
+
+        if (ops.size() == 4) {
+            // the product of the sum with one value (the output scale of a layer), F32 only
+            const ggml_tensor * out = cgraph->nodes[node_idx+3];
+            if (add == nullptr || ops.begin()[3] != GGML_OP_MUL || out->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32) {
+                return false;
+            }
+            const ggml_tensor * scale   = out->src[0] == add ? out->src[1] : out->src[0];
+            const ggml_tensor * add_src = add->src[0] == mul ? add->src[1] : add->src[0];
+            if (scale->type != GGML_TYPE_F32 || ggml_nelements(scale) != 1 || add_src->type != GGML_TYPE_F32) {
+                return false;
+            }
         }
 
         // the mul operand is a norm weight, which model files store as F32;
@@ -5473,6 +5486,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
         return 2;
+    }
+
+    if (node->op == GGML_OP_RMS_NORM && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL }, {})) {
+        ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr, cgraph->nodes[i + 3]);
+        return 3;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {

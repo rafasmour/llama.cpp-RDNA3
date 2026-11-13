@@ -16,7 +16,8 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               dst,
                                      ggml_tensor *               mul_tensor,
                                      ggml_tensor *               add_tensor,
-                                     const ggml_tensor *         q8_1_src1 = nullptr);
+                                     const ggml_tensor *         q8_1_src1 = nullptr,
+                                     ggml_tensor *               scale_tensor = nullptr);
 
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
