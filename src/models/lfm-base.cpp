@@ -37,7 +37,7 @@ ggml_tensor * llm_build_lfm_base::build_lfm_shortconv(const llama_memory_recurre
 
     // read conv state
     auto * conv_state = mctx_recr->get_r_l(il);
-    auto * conv_rs    = build_rs(inp_recr, conv_state, hparams.n_embd_r(), n_seqs);
+    auto * conv_rs    = build_rs_in_place(inp_recr, conv_state, hparams.n_embd_r(), n_seqs);
     auto * conv       = ggml_reshape_3d(ctx0, conv_rs, d_conv, n_embd, n_seqs);
 
     // causal prepends the state, non-causal pads symmetrically for a centered window
