@@ -5473,6 +5473,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // the same with the product that makes the new input in front (B * x of the LFM2 short conv)
+    if (node->op == GGML_OP_MUL && i + 5 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_CONCAT) {
+        const ggml_op ops[]       = { GGML_OP_MUL, GGML_OP_TRANSPOSE, GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY };
+        const int     outputs[]   = { i + 2, i + 4, i + 5 };
+        const int     out_nodes[] = { i + 2 };
+        ggml_tensor * concat      = cgraph->nodes[i + 2];
+        if (ggml_can_fuse_subgraph(cgraph, i, 6, ops, outputs, 3) &&
+                cgraph->nodes[i + 5]->src[1] == cgraph->nodes[i + 4] &&
+                ggml_cuda_can_concat_store(concat, cgraph->nodes[i + 3], cgraph->nodes[i + 5]) &&
+                ggml_cuda_can_concat_store_mul(concat, node) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, out_nodes, 1)) {
+            ggml_cuda_op_concat_store(*cuda_ctx, concat, cgraph->nodes[i + 5], node);
+            return 5;
+        }
+    }
+
     // concat of a conv state with the new input + the copy of the last columns back into the state
     if (node->op == GGML_OP_CONCAT && i + 3 < cgraph->n_nodes) {
         const ggml_op ops[]     = { GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY };
