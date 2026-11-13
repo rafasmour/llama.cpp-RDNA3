@@ -1008,3 +1008,130 @@ bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, 
             return false;
     }
 }
+
+// Two mul_mat with F32 src0 and the same src1 in one launch, each with the bias, activation and factor of the fused
+// mul_mat_vec_f. A block computes one dst value and sums the dot product as mul_mat_vec_f does, so the values are the same.
+static __global__ void mul_mat_vec_f_pair(
+        const float * x_a, const float * x_b, const float * y_ptr, float * dst_a, float * dst_b,
+        const float * bias_a, const float * bias_b, const float * mul_a, const float * mul_b,
+        const int unary_op_a, const int unary_op_b, const int nrows_a, const int ncols2,
+        const int stride_row_a, const int stride_row_b, const int stride_col_y,
+        const int stride_col_dst_a, const int stride_col_dst_b) {
+    constexpr int warp_size  = ggml_cuda_get_physical_warp_size();
+    const int     block_size = blockDim.x;
+    const int     tid        = threadIdx.x;
+    const bool    second     = int(blockIdx.x) >= nrows_a;
+    const int     row        = second ? blockIdx.x - nrows_a : blockIdx.x;
+    const int     col        = blockIdx.y;
+
+    __shared__ float buf_iw[warp_size];
+    if (block_size > warp_size) {
+        if (tid < warp_size) {
+            buf_iw[tid] = 0.0f;
+        }
+        __syncthreads();
+    }
+
+    ggml_cuda_pdl_sync();
+    const float2 * x2 = (const float2 *) (second ? x_b + int64_t(row)*stride_row_b : x_a + int64_t(row)*stride_row_a);
+    const float2 * y2 = (const float2 *) (y_ptr + int64_t(col)*stride_col_y);
+
+    float sumf = 0.0f;
+    for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        const float2 tmpx = x2[col2];
+        const float2 tmpy = y2[col2];
+        ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
+        ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
+    }
+    ggml_cuda_pdl_lc();
+
+    sumf = warp_reduce_sum<warp_size>(sumf);
+    if (block_size > warp_size) {
+        buf_iw[tid/warp_size] = sumf;
+        __syncthreads();
+        if (tid < warp_size) {
+            sumf = buf_iw[tid];
+            sumf = warp_reduce_sum<warp_size>(sumf);
+        }
+    }
+
+    if (tid != 0) {
+        return;
+    }
+
+    const float * bias     = second ? bias_b : bias_a;
+    const float * mul      = second ? mul_b : mul_a;
+    const int     unary_op = second ? unary_op_b : unary_op_a;
+
+    float value = sumf;
+    if (bias) {
+        value += bias[row];
+    }
+    if (unary_op == GGML_UNARY_OP_SIGMOID) {
+        value = ggml_cuda_op_sigmoid_single(value);
+    } else if (unary_op == GGML_UNARY_OP_SOFTPLUS) {
+        value = ggml_cuda_op_softplus_single(value);
+    }
+    if (mul) {
+        value *= mul[row];
+    }
+
+    if (second) {
+        dst_b[int64_t(col)*stride_col_dst_b + row] = value;
+    } else {
+        dst_a[int64_t(col)*stride_col_dst_a + row] = value;
+    }
+}
+
+void ggml_cuda_mul_mat_vec_f_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
+        const ggml_tensor * src0_a, ggml_tensor * dst_a, const ggml_cuda_mm_fusion_args_host * fusion_a,
+        const ggml_tensor * src0_b, ggml_tensor * dst_b, const ggml_cuda_mm_fusion_args_host * fusion_b) {
+    const ggml_tensor *                   src0[2]   = { src0_a, src0_b };
+    const ggml_tensor *                   dst[2]    = { dst_a, dst_b };
+    const ggml_cuda_mm_fusion_args_host * fusion[2] = { fusion_a, fusion_b };
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && src1->nb[0] == sizeof(float) && src1->ne[2] == 1 && src1->ne[3] == 1);
+    GGML_ASSERT(src1->ne[0] % 2 == 0 && (src1->nb[1] / sizeof(float)) % 2 == 0);
+    for (int s = 0; s < 2; ++s) {
+        GGML_ASSERT(src0[s]->type == GGML_TYPE_F32 && dst[s]->type == GGML_TYPE_F32);
+        GGML_ASSERT(src0[s]->nb[0] == sizeof(float) && dst[s]->nb[0] == sizeof(float));
+        GGML_ASSERT(src0[s]->ne[0] == src1->ne[0] && src0[s]->ne[2] == 1 && src0[s]->ne[3] == 1);
+        GGML_ASSERT((src0[s]->nb[1] / sizeof(float)) % 2 == 0);
+        GGML_ASSERT(dst[s]->ne[0] == src0[s]->ne[1] && dst[s]->ne[1] == src1->ne[1] && dst[s]->ne[2] == 1 && dst[s]->ne[3] == 1);
+        GGML_ASSERT(fusion[s]->gate == nullptr && fusion[s]->gate_bias == nullptr);
+        GGML_ASSERT(fusion[s]->x_scale == nullptr && fusion[s]->gate_scale == nullptr);
+        GGML_ASSERT(fusion[s]->unary_op == GGML_UNARY_OP_SIGMOID || fusion[s]->unary_op == GGML_UNARY_OP_SOFTPLUS);
+        for (const ggml_tensor * row : { fusion[s]->x_bias, fusion[s]->unary_mul }) {
+            GGML_ASSERT(row == nullptr ||
+                (row->type == GGML_TYPE_F32 && ggml_is_contiguous(row) && ggml_nelements(row) == dst[s]->ne[0]));
+        }
+    }
+
+    const int64_t ncols     = src1->ne[0];
+    const int     warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+    // the block size of launch_mul_mat_vec_f_cuda for this row length
+    int64_t block_size_best = warp_size;
+    int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
+    for (int64_t block_size = 2*warp_size; block_size <= 256; block_size += warp_size) {
+        const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
+        if (niter < niter_best) {
+            niter_best      = niter;
+            block_size_best = block_size;
+        }
+    }
+
+    const dim3 block_nums(dst_a->ne[0] + dst_b->ne[0], src1->ne[1], 1);
+    const dim3 block_dims(block_size_best, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, ctx.stream());
+    ggml_cuda_kernel_launch(mul_mat_vec_f_pair, launch_params,
+        (const float *) src0_a->data, (const float *) src0_b->data, (const float *) src1->data,
+        (float *) dst_a->data, (float *) dst_b->data,
+        fusion_a->x_bias ? (const float *) fusion_a->x_bias->data : nullptr,
+        fusion_b->x_bias ? (const float *) fusion_b->x_bias->data : nullptr,
+        fusion_a->unary_mul ? (const float *) fusion_a->unary_mul->data : nullptr,
+        fusion_b->unary_mul ? (const float *) fusion_b->unary_mul->data : nullptr,
+        (int) fusion_a->unary_op, (int) fusion_b->unary_op, (int) dst_a->ne[0], (int) (ncols/2),
+        (int) (src0_a->nb[1] / sizeof(float)), (int) (src0_b->nb[1] / sizeof(float)), (int) (src1->nb[1] / sizeof(float)),
+        (int) (dst_a->nb[1] / sizeof(float)), (int) (dst_b->nb[1] / sizeof(float)));
+}

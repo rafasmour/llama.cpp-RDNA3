@@ -12,3 +12,8 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, int64_t ne11);
+
+// two mul_mat with F32 src0 and the same src1 in one launch, with the fused bias / activation / factor of mul_mat_vec_f
+void ggml_cuda_mul_mat_vec_f_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
+    const ggml_tensor * src0_a, ggml_tensor * dst_a, const ggml_cuda_mm_fusion_args_host * fusion_a,
+    const ggml_tensor * src0_b, ggml_tensor * dst_b, const ggml_cuda_mm_fusion_args_host * fusion_b);
