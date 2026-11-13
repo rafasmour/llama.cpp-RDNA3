@@ -679,7 +679,15 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
+// Routed expert types that take a Q8_0 shared expert into their launch. On RDNA3 they run with one warp and one row per block.
+static constexpr __host__ __device__ bool mmvq_mixed_shared_expert(const ggml_type type) {
+    return type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S ||
+           type == GGML_TYPE_IQ4_XS;
+}
+
+// type_shared: type of the shared expert if it differs from type, see mmvq_mixed_shared_expert
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false,
+    ggml_type type_shared = GGML_TYPE_COUNT>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -803,7 +811,34 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    // A shared expert of another type: the same threads, with the steps of its type through the row. Its matrices are contiguous.
+    bool shared_done = false;
+    if constexpr (type_shared != GGML_TYPE_COUNT) {
+        static_assert(has_fusion && ncols_dst == 1 && !small_k && !halve_iters, "shared expert of another type: single column only");
+        if (shared_expert) {
+            constexpr int qk_s  = ggml_cuda_type_traits<type_shared>::qk;
+            constexpr int qi_s  = ggml_cuda_type_traits<type_shared>::qi;
+            constexpr int vdr_s = get_vdr_mmvq(type_shared, ncols_dst, table_id);
+            constexpr vec_dot_q_cuda_t vec_dot_q_cuda_s = get_vec_dot_q_cuda(type_shared, vdr_s);
+            constexpr int blocks_per_iter_s = vdr_s * nwarps*warp_size / qi_s;
+            static_assert(blocks_per_iter_s >= 1 && qi_s % vdr_s == 0, "bad steps for the shared expert");
+            const int blocks_per_row_s = ncols_x / qk_s;
+
+            for (int kbx = tid / (qi_s/vdr_s); kbx < blocks_per_row_s; kbx += blocks_per_iter_s) {
+                const int kby = kbx * (qk_s/QK8_1);
+                const int kqs = vdr_s * (tid % (qi_s/vdr_s));
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    const int kbx_row = (row0 + i)*blocks_per_row_s + kbx;
+                    tmp[0][i]      += vec_dot_q_cuda_s(vx,    &y[kby], kbx_row, kqs);
+                    tmp_gate[0][i] += vec_dot_q_cuda_s(vgate, &y[kby], kbx_row, kqs);
+                }
+            }
+            shared_done = true;
+        }
+    }
+
+    for (int kbx = shared_done ? blocks_per_row_x : tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
         // x block quant index when casting the quants to int
@@ -1159,6 +1194,18 @@ static void mul_mat_vec_q_switch_fusion(
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.unary_op != GGML_UNARY_OP_COUNT;
     if (has_fusion) {
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+#ifdef GGML_USE_HIP
+        if constexpr (c_ncols_dst == 1 && !small_k && !halve_iters && mmvq_mixed_shared_expert(type)) {
+            if (fusion.shared_up != nullptr && fusion.shared_type == GGML_TYPE_Q8_0) {
+                ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, false, false, GGML_TYPE_Q8_0>, launch_params,
+                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                return;
+            }
+        }
+#endif // GGML_USE_HIP
+        GGML_ASSERT(fusion.shared_type == GGML_TYPE_COUNT);
         ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
              vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
              channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -1602,17 +1649,22 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(ids && fusion->gate && fusion->shared_gate && fusion->shared_dst);
             GGML_ASSERT(!fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
             GGML_ASSERT(ne11 == 1 && ne03 == 1 && ne13 == 1);
-            GGML_ASSERT(fusion->shared_up->type == src0->type && fusion->shared_gate->type == src0->type);
+            const bool shared_mixed = fusion->shared_up->type != src0->type;
+            GGML_ASSERT(fusion->shared_gate->type == fusion->shared_up->type);
+            GGML_ASSERT(!shared_mixed || (ggml_cuda_mmvq_mixed_shared_expert(src0->type, fusion->shared_up->type, cc) && dst->ne[2] == 1));
             GGML_ASSERT(ggml_are_same_shape(fusion->shared_up, fusion->shared_gate));
             GGML_ASSERT(ggml_is_contiguous(fusion->shared_up) && ggml_is_contiguous(fusion->shared_gate));
             GGML_ASSERT(fusion->shared_up->ne[0] == ne00 && fusion->shared_up->ne[1] == ne01);
-            GGML_ASSERT(fusion->shared_up->nb[1] == nb01 && ggml_is_matrix(fusion->shared_up));
+            GGML_ASSERT((shared_mixed || fusion->shared_up->nb[1] == nb01) && ggml_is_matrix(fusion->shared_up));
             GGML_ASSERT(fusion->shared_dst->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->shared_dst));
             GGML_ASSERT(fusion->shared_dst->ne[0] == ne0 && fusion->shared_dst->ne[1] == ne2);
             fusion_local.shared_up   = fusion->shared_up->data;
             fusion_local.shared_gate = fusion->shared_gate->data;
             fusion_local.shared_dst  = (float *) fusion->shared_dst->data;
             fusion_local.shared_stride_col_dst = fusion->shared_dst->nb[1] / ts_dst;
+            if (shared_mixed) {
+                fusion_local.shared_type = fusion->shared_up->type;
+            }
         }
 
         if (fusion->x_bias) {
@@ -1758,4 +1810,15 @@ void ggml_cuda_op_mul_mat_vec_q(
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+}
+
+bool ggml_cuda_mmvq_mixed_shared_expert(const ggml_type type_routed, const ggml_type type_shared, const int cc) {
+#ifdef GGML_USE_HIP
+    // the routed types must keep one warp without small_k there, as the kernel instance with the shared type assumes
+    return GGML_CUDA_CC_IS_RDNA3_0(cc) && type_shared == GGML_TYPE_Q8_0 && mmvq_mixed_shared_expert(type_routed) &&
+           calc_nwarps(type_routed, 1, MMVQ_PARAMETERS_RDNA3_0) == 1;
+#else
+    GGML_UNUSED_VARS(type_routed, type_shared, cc);
+    return false;
+#endif // GGML_USE_HIP
 }

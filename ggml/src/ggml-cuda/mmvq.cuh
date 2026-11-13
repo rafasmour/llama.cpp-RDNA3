@@ -19,3 +19,6 @@ void ggml_cuda_op_mul_mat_vec_q(
 
 // launch arguments of the q8_1 copy that ggml_cuda_mul_mat_vec_q makes of src1, the key of the q8_1 cache
 void ggml_cuda_mmvq_q8_1_args(const ggml_tensor * src1, int64_t args[8]);
+
+// whether a shared expert of type_shared runs in the launch of routed experts of another type (one token)
+bool ggml_cuda_mmvq_mixed_shared_expert(ggml_type type_routed, ggml_type type_shared, int cc);

@@ -6203,12 +6203,14 @@ struct test_mul_mat_id_fusion : public test_case {
 struct test_mul_mat_id_shared : public test_case {
     const ggml_type type;
     const int64_t n;
+    const ggml_type type_shared; // type of the shared expert, the routed experts have `type`
     ggml_tensor * routed = nullptr;
     ggml_tensor * shared = nullptr;
 
-    test_mul_mat_id_shared(ggml_type type, int64_t n) : type(type), n(n) {}
+    test_mul_mat_id_shared(ggml_type type, int64_t n, ggml_type type_shared = GGML_TYPE_COUNT)
+        : type(type), n(n), type_shared(type_shared == GGML_TYPE_COUNT ? type : type_shared) {}
 
-    std::string vars() override { return VARS_TO_STR2(type, n); }
+    std::string vars() override { return VARS_TO_STR3(type, n, type_shared); }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_SHARED"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
@@ -6221,8 +6223,8 @@ struct test_mul_mat_id_shared : public test_case {
         ggml_set_name(ids, "ids");
         ggml_tensor * up = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
         ggml_tensor * gate = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
-        ggml_tensor * shared_up = ggml_new_tensor_2d(ctx, type, 512, 128);
-        ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, type, 512, 128);
+        ggml_tensor * shared_up = ggml_new_tensor_2d(ctx, type_shared, 512, 128);
+        ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, type_shared, 512, 128);
         routed = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gate, input_ids, ids), ggml_mul_mat_id(ctx, up, input_ids, ids));
         shared = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, shared_gate, input), ggml_mul_mat(ctx, shared_up, input));
         return ggml_add(ctx, routed, ggml_reshape_3d(ctx, shared, 128, 1, n));
@@ -12754,6 +12756,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n : { 1, 2, 3, 4, 8, 9 }) {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
             test_cases.emplace_back(new test_mul_mat_id_shared_input(type, n));
+        }
+    }
+    // a shared expert of another type than the routed experts, as in files with Q8_0 shared and I-quant routed experts
+    for (ggml_type type : { GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K }) {
+        for (int64_t n : { 1, 3 }) {
+            test_cases.emplace_back(new test_mul_mat_id_shared(type, n, GGML_TYPE_Q8_0));
         }
     }
 
