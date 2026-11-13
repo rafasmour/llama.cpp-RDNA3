@@ -93,7 +93,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
 }
 
 // do_quantize: also write the result as q8_1 blocks, as quantize_q8_1 would for the mat-vec that reads it (do_vec only,
-// rows without padding). A thread holds 4 values, so 8 consecutive lanes hold one block.
+// rows of whole blocks). A thread holds 4 values, so 8 consecutive lanes hold one block.
 template <int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool do_quantize = false>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
@@ -217,8 +217,9 @@ static __global__ void rms_norm_f32(const float * x,
 
                             const int sum = lane_group_reduce_sum<8>((int) q0 + (int) q1 + (int) q2 + (int) q3);
 
-                            const int64_t i4_cont = ((int64_t) (sample*nchannels + channel)*nrows + row)*ncols4 + i;
-                            block_q8_1 *  y       = (block_q8_1 *) q8_1 + i4_cont / (QK8_1/4);
+                            // the rows of the copy are padded as for quantize_q8_1, the mat-vec does not read the padding
+                            const int64_t row_cont = (int64_t) (sample*nchannels + channel)*nrows + row;
+                            block_q8_1 *  y        = (block_q8_1 *) q8_1 + row_cont*(GGML_PAD(ncols, MATRIX_ROW_PADDING)/QK8_1) + i / (QK8_1/4);
                             const int     iqs     = 4*(i % (QK8_1/4));
 
                             y->qs[iqs + 0] = q0;
@@ -467,8 +468,8 @@ static bool rms_norm_f32_dispatch(
 
     const int n4 = ncols / 4;
     if constexpr (do_quantize) {
-        // the q8_1 copy needs the vector kernel and rows of whole blocks without padding
-        if (!vec || n4 > 4096 || ncols % MATRIX_ROW_PADDING != 0) {
+        // the q8_1 copy needs the vector kernel and rows of whole blocks
+        if (!vec || n4 > 4096 || ncols % QK8_1 != 0) {
             rms_norm_f32_dispatch<do_multiply, do_add, do_scale, false>(
                 blocks_num, x_t, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
                 mul_t, mul_stride_row, mul_stride_channel, mul_stride_sample,
@@ -764,7 +765,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ggml_cuda_mmvq_q8_1_args(q8_1_src1, q_args);
         ctx.q8_1_cache.clear();
         ctx.q8_1_cache.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(
-            ctx.pool(), ggml_nelements(q8_1_src1) * sizeof(block_q8_1) / QK8_1);
+            ctx.pool(), q_args[7]*q_args[6]*q_args[5]*q_args[4] * sizeof(block_q8_1) / QK8_1);
         q8_1 = ctx.q8_1_cache.buf->get();
     }
 
@@ -866,7 +867,7 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
         ggml_cuda_mmvq_q8_1_args(q8_1_src1, q_args);
         ctx.q8_1_cache.clear();
         ctx.q8_1_cache.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(
-            ctx.pool(), ggml_nelements(q8_1_src1) * sizeof(block_q8_1) / QK8_1);
+            ctx.pool(), q_args[7]*q_args[6]*q_args[5]*q_args[4] * sizeof(block_q8_1) / QK8_1);
         q8_1 = ctx.q8_1_cache.buf->get();
     }
 

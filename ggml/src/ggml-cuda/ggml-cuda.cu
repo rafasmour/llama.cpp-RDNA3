@@ -2316,8 +2316,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(
 // q8_1 cache: the kernel that writes the output can then write the q8_1 copy as well, which saves the quantize launch.
 // A wrong guess only costs the copy, ggml_cuda_mul_mat_vec_q checks the cache key.
 // same_rows: the writer works on rows, so the mat-vec has to see the same row length
+// padded_rows: the writer can leave out the padding of a row of the copy
 static const ggml_tensor * ggml_cuda_q8_1_consumer(const ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int out_idx,
-                                                   const bool same_rows = true) {
+                                                   const bool same_rows = true, const bool padded_rows = false) {
     const ggml_tensor * out = cgraph->nodes[out_idx];
     if (cuda_ctx->curr_stream_no != 0 || out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out)) {
         return nullptr;
@@ -2339,7 +2340,8 @@ static const ggml_tensor * ggml_cuda_q8_1_consumer(const ggml_backend_cuda_conte
                                        ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                        src0->view_src;
         if (!mmvq || bad_padding_clear || src1->data != out->data || src1->type != GGML_TYPE_F32 || n->type != GGML_TYPE_F32 ||
-                !ggml_is_contiguous(src1) || src1->ne[0] % MATRIX_ROW_PADDING != 0 || (same_rows && src1->ne[0] != out->ne[0]) ||
+                !ggml_is_contiguous(src1) || src1->ne[0] % (padded_rows ? QK8_1 : MATRIX_ROW_PADDING) != 0 ||
+                (same_rows && src1->ne[0] != out->ne[0]) ||
                 ggml_nelements(src1) != ggml_nelements(out) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             return nullptr;
         }
@@ -5471,12 +5473,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
-                                        ggml_cuda_q8_1_consumer(cuda_ctx, cgraph, i + 2));
+                                        ggml_cuda_q8_1_consumer(cuda_ctx, cgraph, i + 2, true, true));
         return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], ggml_cuda_q8_1_consumer(cuda_ctx, cgraph, i + 1));
+        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], ggml_cuda_q8_1_consumer(cuda_ctx, cgraph, i + 1, true, true));
         return 1;
     }
 

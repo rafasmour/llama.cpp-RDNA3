@@ -12445,6 +12445,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int mode : {1, 2, 3, 4, 5}) {
             for (int64_t n : {1, 5}) {
                 test_cases.emplace_back(new test_rms_norm_mul_mat(type_a, 33, n, 1024, mode));
+                test_cases.emplace_back(new test_rms_norm_mul_mat(type_a, 33, n,  768, mode));
             }
         }
     }
