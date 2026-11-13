@@ -1476,6 +1476,9 @@ struct ggml_backend_cuda_context {
             writer = nullptr;
         }
     } q8_1_cache;
+
+    // src1 of the quantized mat-vec that reads the result of the flash attention node to run, see ggml_cuda_q8_1_consumer
+    const ggml_tensor * fattn_q8_1_src1 = nullptr;
 };
 
 struct ggml_cuda_mm_fusion_args_host {
