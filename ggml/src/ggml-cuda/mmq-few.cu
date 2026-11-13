@@ -1238,9 +1238,12 @@ static int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const
         if (!mmq_few_wmma_supported(type) || ne00 < 8*QK_K) {
             return 0;
         }
-        // RX 7900 XT: up to 6 columns the mat-vec kernel with its fused variants is as fast or faster
         const int min_ncols = mmq_few_wmma_ncols_range(type).x;
-        return GGML_CUDA_CC_IS_RDNA3_0(cc) ? std::max(min_ncols, 7) : min_ncols;
+        if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+            // RX 7900 XT: up to 6 columns the mat-vec kernel with its fused variants is as fast or faster, for Q8_0 up to 8
+            return type == GGML_TYPE_Q8_0 ? 9 : std::max(min_ncols, 7);
+        }
+        return min_ncols;
     }
 
     // NVIDIA Ampere to Blackwell
