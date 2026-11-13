@@ -8282,6 +8282,53 @@ struct test_mul_mat_gate : public test_case {
     }
 };
 
+// both gates of a gated delta net layer from one input: mul_mat + add + softplus + mul and mul_mat + sigmoid
+struct test_mul_mat_gate_pair : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool beta_first; // order of the two gates in the graph
+
+    test_mul_mat_gate_pair(ggml_type type_a, int64_t m, int64_t n, int64_t k, bool beta_first)
+        : type_a(type_a), m(m), n(n), k(k), beta_first(beta_first) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, m, n, k, beta_first);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_GATE_PAIR";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * b  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * wa = ggml_new_tensor_2d(ctx, type_a,        k, m);
+        ggml_tensor * wb = ggml_new_tensor_2d(ctx, type_a,        k, m);
+        ggml_tensor * dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_tensor * sa = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+
+        ggml_tensor * alpha = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, ggml_mul_mat(ctx, wa, b), dt)), sa);
+        alpha = ggml_reshape_4d(ctx, alpha, 1, m, n, 1);
+
+        ggml_tensor * beta = ggml_sigmoid(ctx, ggml_mul_mat(ctx, wb, b));
+        beta = ggml_reshape_4d(ctx, beta, 1, m, n, 1);
+
+        // the first operand is expanded first
+        ggml_tensor * out = beta_first ? ggml_add(ctx, beta, alpha) : ggml_add(ctx, alpha, beta);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // rms_norm + mul followed by mat-muls with quantized weights, as at the start of an attention or feed-forward block:
 // backends may quantize the activations in the norm kernel and share them between the mat-muls
 struct test_rms_norm_mul_mat : public test_case {
@@ -12319,6 +12366,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n : {1, 4}) {
             for (bool softplus : {false, true}) {
                 test_cases.emplace_back(new test_mul_mat_gate(type_a, 32, n, 2048, softplus));
+            }
+        }
+    }
+    // both gates from one input: F32 weights take one launch on RDNA3, the other types two
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int64_t n : {1, 4}) {
+            for (bool beta_first : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_gate_pair(type_a, 32, n, 2048, beta_first));
             }
         }
     }
