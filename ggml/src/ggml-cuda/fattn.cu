@@ -680,15 +680,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    // only the MMA kernel reads K/V through kv_rows
-    if (kv_rows) {
+    // The MMA kernel reads K/V through kv_rows. On RDNA3 the tile and vec kernels do so too and the usual choice applies,
+    // for F16 K/V only: quantized K/V would be converted for the whole pool in each launch.
+    const bool kv_rows_rdna3 = kv_rows && amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA3_0(cc) && mask &&
+        K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+    if (kv_rows && !kv_rows_rdna3) {
         return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && mask && Q->ne[0] != 40 && Q->ne[0] != 72 ?
             BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && n_kv % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc)) {
