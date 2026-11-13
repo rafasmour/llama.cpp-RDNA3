@@ -8365,6 +8365,40 @@ struct test_mul_mat_gate_pair : public test_case {
 
 // rms_norm + mul followed by mat-muls with quantized weights, as at the start of an attention or feed-forward block:
 // backends may quantize the activations in the norm kernel and share them between the mat-muls
+// The end of a layer with an output scale: (rms_norm(x) * w + residual) * s with a single value s,
+// which backends may compute in one pass
+struct test_rms_norm_mul_add_scale : public test_case {
+    const int64_t k;
+    const int64_t n;
+
+    test_rms_norm_mul_add_scale(int64_t k, int64_t n) : k(k), n(n) {}
+
+    std::string vars() override {
+        return VARS_TO_STR2(k, n);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_ADD_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+
+        ggml_tensor * cur = ggml_mul(ctx, ggml_add(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w), r), s);
+        // the next layer reads the result twice
+        ggml_tensor * out = ggml_add(ctx, cur, ggml_mul(ctx, ggml_rms_norm(ctx, cur, 1e-6f), w));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 struct test_rms_norm_mul_mat : public test_case {
     const ggml_type type_a;
     const int64_t m;
@@ -12485,6 +12519,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (bool beta_first : {false, true}) {
                 test_cases.emplace_back(new test_mul_mat_gate_pair(type_a, 32, n, 2048, beta_first));
             }
+        }
+    }
+
+    // layer output scale after the residual: vector and scalar kernel, every block size
+    for (int64_t k : {30, 64, 256, 1024, 5376, 20000}) {
+        for (int64_t n : {1, 5}) {
+            test_cases.emplace_back(new test_rms_norm_mul_add_scale(k, n));
         }
     }
 
