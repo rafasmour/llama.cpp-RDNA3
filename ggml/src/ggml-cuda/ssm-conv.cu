@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "mmvq.cuh"
 #include "ssm-conv.cuh"
 #include "unary.cuh"
 
@@ -123,6 +124,80 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
     }
 }
 
+// ssm_conv of a few tokens and the product with a gate of the same shape (LFM2 short conv).
+// do_quantize: also write the result as q8_1 blocks, as quantize_q8_1 would for the mat-vec that reads it
+// (a warp holds the values of one block, a row of the copy has q8_1_row_blocks blocks)
+template <size_t split_d_inner, size_t d_conv, bool do_quantize>
+static __global__ void ssm_conv_mul_f32(const float * src0_ptr, const float * src1_ptr, const float * gate_ptr,
+                                        const int src0_nb1, const int src0_nb2, const int src1_nb1,
+                                        const int gate_nb1, const int gate_nb2,
+                                        float * dst_ptr, const int dst_nb1, const int dst_nb2,
+                                        const int n_t, const int q8_1_row_blocks, void * q8_1) {
+    ggml_cuda_pdl_lc();
+    const float * GGML_CUDA_RESTRICT src0 = src0_ptr;
+    const float * GGML_CUDA_RESTRICT src1 = src1_ptr;
+    const float * GGML_CUDA_RESTRICT gate = gate_ptr;
+    float       * GGML_CUDA_RESTRICT dst  = dst_ptr;
+    const int tid  = threadIdx.x;
+    const int bidx = blockIdx.x;
+    const int bidy = blockIdx.y;
+    const int col  = bidy * split_d_inner + tid;
+
+    const float * x_block = (const float *) ((const char *) src0 + bidx * src0_nb2 + bidy * split_d_inner * src0_nb1);
+    const float * w_block = (const float *) ((const char *) src1 + bidy * split_d_inner * src1_nb1);
+    const float * g_block = (const float *) ((const char *) gate + bidx * gate_nb2) + col;
+    float *       y_block = (float *) ((char *) dst + bidx * dst_nb2) + col;
+
+    const int stride_x = src0_nb1 / sizeof(float);
+    const int stride_w = src1_nb1 / sizeof(float);
+    const int stride_g = gate_nb1 / sizeof(float);
+    const int stride_y = dst_nb1 / sizeof(float);
+
+    float x[d_conv] = { 0.0f };
+    float w[d_conv] = { 0.0f };
+
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (size_t j = 0; j < d_conv; j++) {
+        w[j] = w_block[tid * stride_w + j];
+    }
+
+    for (int i = 0; i < n_t; i++) {
+        float sumf = 0.0f;
+
+        if (i == 0) {
+            for (size_t j = 0; j < d_conv; j++) {
+                x[j] = x_block[tid * stride_x + j];
+            }
+        } else {
+            x[(i - 1) % d_conv] = x_block[tid * stride_x + i + d_conv - 1];
+        }
+
+#pragma unroll
+        for (size_t j = 0; j < d_conv; j++) {
+            sumf += x[(i + j) % d_conv] * w[j];
+        }
+
+        const float v = g_block[i * stride_g] * sumf;
+        y_block[i * stride_y] = v;
+
+        if constexpr (do_quantize) {
+            // same arithmetic as quantize_q8_1
+            const float  amax = warp_reduce_max<QK8_1>(fabsf(v));
+            const float  d    = amax / 127.0f;
+            const int8_t q    = amax == 0.0f ? 0 : roundf(v / d);
+            const int    sum  = warp_reduce_sum<QK8_1>((int) q);
+
+            block_q8_1 * y   = (block_q8_1 *) q8_1 + (int64_t) (bidx * n_t + i) * q8_1_row_blocks + col / QK8_1;
+            const int    iqs = col % QK8_1;
+            y->qs[iqs] = q;
+            if (iqs == 0) {
+                y->ds = make_half2(d, d * sum);
+            }
+        }
+    }
+}
+
 template <bool apply_silu>
 static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
@@ -203,5 +278,88 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     } else {
         ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
                           out->nb[2], nc, nr, n_t, n_s, stream);
+    }
+}
+
+#define CUDA_SSM_CONV_MUL_BLOCK_SIZE 128
+
+bool ggml_cuda_can_ssm_conv_mul(const ggml_tensor * conv, const ggml_tensor * mul) {
+    const ggml_tensor * src0 = conv->src[0];
+    const ggml_tensor * src1 = conv->src[1];
+    const ggml_tensor * gate = mul->src[0] == conv ? mul->src[1] : mul->src[0];
+    const int64_t       nc   = src1->ne[0];
+
+    if (gate == conv || conv->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+            src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // the kernel sizes of ssm_conv_f32_cuda, a few tokens
+    if ((nc != 3 && nc != 4 && nc != 5 && nc != 7 && nc != 9 && nc != 15) || conv->ne[1] > 32 || conv->ne[3] != 1 ||
+            conv->ne[0] % CUDA_SSM_CONV_MUL_BLOCK_SIZE != 0) {
+        return false;
+    }
+    if (!ggml_are_same_shape(gate, conv) || !ggml_are_same_shape(mul, conv) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+    return src0->nb[0] == sizeof(float) && src0->nb[1] == src0->ne[0] * sizeof(float) && src1->nb[0] == sizeof(float) &&
+           gate->nb[0] == sizeof(float) && gate->nb[1] % sizeof(float) == 0 && gate->nb[2] % sizeof(float) == 0;
+}
+
+void ggml_cuda_op_ssm_conv_mul(ggml_backend_cuda_context & ctx, ggml_tensor * conv, ggml_tensor * mul, const ggml_tensor * q8_1_src1) {
+    const ggml_tensor * src0 = conv->src[0]; // conv_x
+    const ggml_tensor * src1 = conv->src[1]; // conv1d.weight
+    const ggml_tensor * gate = mul->src[0] == conv ? mul->src[1] : mul->src[0];
+
+    const int64_t nc  = src1->ne[0]; // d_conv
+    const int64_t nr  = mul->ne[0];  // d_inner
+    const int     n_t = mul->ne[1];  // tokens per sequence
+    const int     n_s = mul->ne[2];  // number of sequences in the batch
+
+    GGML_ASSERT(src0->ne[1] == nr && nr % CUDA_SSM_CONV_MUL_BLOCK_SIZE == 0);
+
+    // The next quantized mat-vec reads the result as q8_1 blocks: write them here, into the cache that it looks up.
+    void *  q8_1 = nullptr;
+    int64_t q_args[8];
+    if (q8_1_src1 != nullptr) {
+        GGML_ASSERT(q8_1_src1->data == mul->data && q8_1_src1->ne[0] == nr && ggml_nelements(q8_1_src1) == ggml_nelements(mul));
+        ggml_cuda_mmvq_q8_1_args(q8_1_src1, q_args);
+        ctx.q8_1_cache.clear();
+        ctx.q8_1_cache.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(
+            ctx.pool(), q_args[7]*q_args[6]*q_args[5]*q_args[4] * sizeof(block_q8_1) / QK8_1);
+        q8_1 = ctx.q8_1_cache.buf->get();
+    }
+    const int q8_1_row_blocks = GGML_PAD(nr, MATRIX_ROW_PADDING) / QK8_1;
+
+    const dim3 blocks(n_s, nr / CUDA_SSM_CONV_MUL_BLOCK_SIZE, 1);
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params(blocks, CUDA_SSM_CONV_MUL_BLOCK_SIZE, 0, ctx.stream());
+
+    auto launch_kernel = [&](auto NC) {
+        constexpr int kNC = decltype(NC)::value;
+        const auto launch = [&](auto kernel) {
+            ggml_cuda_kernel_launch(kernel, launch_params,
+                (const float *) src0->data, (const float *) src1->data, (const float *) gate->data,
+                (int) src0->nb[1], (int) src0->nb[2], (int) src1->nb[1], (int) gate->nb[1], (int) gate->nb[2],
+                (float *) mul->data, (int) mul->nb[1], (int) mul->nb[2], n_t, q8_1_row_blocks, q8_1);
+        };
+        if (q8_1 != nullptr) {
+            launch(ssm_conv_mul_f32<CUDA_SSM_CONV_MUL_BLOCK_SIZE, kNC, true>);
+        } else {
+            launch(ssm_conv_mul_f32<CUDA_SSM_CONV_MUL_BLOCK_SIZE, kNC, false>);
+        }
+    };
+
+    switch (nc) {
+        case 3:  launch_kernel(std::integral_constant<int, 3 >{}); break;
+        case 4:  launch_kernel(std::integral_constant<int, 4 >{}); break;
+        case 5:  launch_kernel(std::integral_constant<int, 5 >{}); break;
+        case 7:  launch_kernel(std::integral_constant<int, 7 >{}); break;
+        case 9:  launch_kernel(std::integral_constant<int, 9 >{}); break;
+        case 15: launch_kernel(std::integral_constant<int, 15>{}); break;
+        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 7, 9, 15 right now.");
+    }
+
+    if (q8_1_src1 != nullptr) {
+        ctx.q8_1_cache.set(q8_1_src1, q_args, mul);
     }
 }
