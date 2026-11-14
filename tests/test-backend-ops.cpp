@@ -8515,12 +8515,13 @@ struct test_unary_mul_mul_mat : public test_case {
     const int64_t n;
     const int64_t k;
     const int64_t heads; // > 1: the gate works on [k/heads, heads, n] and the mat-mul reads it reshaped to [k, n]
+    const bool    rows;  // the gate is a contiguous copy of every second row of a wider tensor (needs heads > 1)
 
-    test_unary_mul_mul_mat(ggml_type type_a, ggml_unary_op op, int64_t m, int64_t n, int64_t k, int64_t heads)
-        : type_a(type_a), op(op), m(m), n(n), k(k), heads(heads) {}
+    test_unary_mul_mul_mat(ggml_type type_a, ggml_unary_op op, int64_t m, int64_t n, int64_t k, int64_t heads, bool rows = false)
+        : type_a(type_a), op(op), m(m), n(n), k(k), heads(heads), rows(rows) {}
 
     std::string vars() override {
-        return VARS_TO_STR6(type_a, op, m, n, k, heads);
+        return VARS_TO_STR7(type_a, op, m, n, k, heads, rows);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -8535,11 +8536,22 @@ struct test_unary_mul_mul_mat : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k / heads, heads, n);
-        ggml_tensor * g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k / heads, heads, n);
         ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
-
-        ggml_tensor * cur = ggml_mul(ctx, x, ggml_unary(ctx, g, op));
+        ggml_tensor * cur;
+        if (rows) {
+            // as the attention gate of Qwen3.5: [2*k, n] holds per head a row of other values and a row of the gate
+            const int64_t hs = k / heads;
+            ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_tensor * qg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*k, n);
+            ggml_tensor * g  = ggml_view_3d(ctx, qg, hs, heads, n, ggml_element_size(qg) * hs * 2,
+                    ggml_element_size(qg) * hs * 2 * heads, ggml_element_size(qg) * hs);
+            g   = ggml_cont_2d(ctx, g, k, n);
+            cur = ggml_mul(ctx, x, ggml_unary(ctx, g, op));
+        } else {
+            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k / heads, heads, n);
+            ggml_tensor * g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k / heads, heads, n);
+            cur = ggml_mul(ctx, x, ggml_unary(ctx, g, op));
+        }
         cur = ggml_reshape_2d(ctx, cur, k, n);
         ggml_tensor * out = ggml_mul_mat(ctx, a, cur);
         ggml_set_name(out, "out");
@@ -12640,6 +12652,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 for (int64_t n : {1, 5, 9}) {
                     test_cases.emplace_back(new test_unary_mul_mul_mat(type_a, op, 33, n, k, 1));
                     test_cases.emplace_back(new test_unary_mul_mul_mat(type_a, op, 33, n, k, 8));
+                    if (op == GGML_UNARY_OP_SIGMOID) {
+                        test_cases.emplace_back(new test_unary_mul_mul_mat(type_a, op, 33, n, k, 8, true));
+                    }
                 }
             }
         }

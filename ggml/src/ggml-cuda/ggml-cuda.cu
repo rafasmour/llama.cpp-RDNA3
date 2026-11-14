@@ -4352,6 +4352,39 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    // contiguous copy of rows at a regular stride + sigmoid + mul (the attention gate of Qwen3.5 is every second row of
+    // the Q projection): the unary + mul kernel reads the rows, the copy is not made
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_CONT && ops.begin()[1] == GGML_OP_UNARY && ops.begin()[2] == GGML_OP_MUL
+     && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID) {
+        const ggml_tensor * cont  = cgraph->nodes[node_idx];
+        const ggml_tensor * unary = cgraph->nodes[node_idx+1];
+        const ggml_tensor * mul   = cgraph->nodes[node_idx+2];
+        const ggml_tensor * rows  = cont->src[0];
+        const ggml_tensor * other = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
+
+        if (ggml_get_unary_op(unary) != GGML_UNARY_OP_SIGMOID || unary->src[0] != cont) {
+            return false;
+        }
+        if (rows->type != GGML_TYPE_F32 || cont->type != GGML_TYPE_F32 || unary->type != GGML_TYPE_F32 ||
+                mul->type != GGML_TYPE_F32 || other->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_is_contiguous(cont) || !ggml_is_contiguous(other) || !ggml_are_same_shape(other, unary) ||
+                ggml_nelements(rows) != ggml_nelements(cont)) {
+            return false;
+        }
+        if (rows->nb[0] != sizeof(float) || rows->nb[1] % sizeof(float) != 0 ||
+                rows->nb[2] != (size_t) rows->ne[1]*rows->nb[1] || rows->nb[3] != (size_t) rows->ne[2]*rows->nb[2]) {
+            return false;
+        }
+        // the result may take the place of the other factor, but not of the rows, which have another layout
+        const char * dst_start  = (const char *) mul->data;
+        const char * dst_end    = dst_start + ggml_nbytes(mul);
+        const char * rows_start = (const char *) rows->data;
+        const char * rows_end   = rows_start + ggml_nbytes(rows);
+        return dst_end <= rows_start || rows_end <= dst_start;
+    }
+
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL
      && unary_ops.size() == 1 && (unary_ops.begin()[0] == GGML_UNARY_OP_SILU || unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID || unary_ops.begin()[0] == GGML_UNARY_OP_SOFTPLUS ||
                                   unary_ops.begin()[0] == GGML_UNARY_OP_GELU)) {
@@ -5557,6 +5590,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_op_sigmoid_gate_add(*cuda_ctx, gate, shexp, moe, res, cgraph->nodes[i + 3]);
             return 3;
         }
+    }
+
+    if (node->op == GGML_OP_CONT && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID })) {
+        ggml_cuda_op_unary_mul(*cuda_ctx, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+                               ggml_cuda_q8_1_consumer(cuda_ctx, cgraph, i + 2, false), node->src[0]);
+        return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
