@@ -5946,6 +5946,47 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
+// Several mat-muls that read the same input (Q / K / V, gate / up), then the input is changed in place and read again:
+// backends may convert an input once for the mat-muls that follow each other, but not across the change.
+struct test_mul_mat_shared_input : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    test_mul_mat_shared_input(ggml_type type_a, int64_t m, int64_t n, int64_t k)
+        : type_a(type_a), m(m), n(n), k(k) {}
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_a, m, n, k);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SHARED_INPUT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a1 = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * a2 = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * a3 = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, a1, x), ggml_mul_mat(ctx, a2, x));
+        ggml_tensor * x2  = ggml_scale_inplace(ctx, x, -0.5f);
+        out = ggml_add(ctx, out, ggml_mul_mat(ctx, a3, x2));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // FP4 W4A8 path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_w4a8 : public test_mul_mat {
     test_mul_mat_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -12452,6 +12493,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 512, 1, 512));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 32, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 256, 512, 256)); // many rows
+    // mat-muls on one input, small and large batches, float and quantized weights; the last shape is one that backends
+    // may run as a float matrix product on dequantized weights
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+        for (int64_t n : {1, 16, 64, 512}) {
+            test_cases.emplace_back(new test_mul_mat_shared_input(type_a, 48, n, 256));
+        }
+        test_cases.emplace_back(new test_mul_mat_shared_input(type_a, 96, 512, 4096));
+    }
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
     test_cases.emplace_back(
         new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 16384, 1, 16384));               // too big (N>8192)
