@@ -1477,8 +1477,9 @@ struct ggml_backend_cuda_context {
         }
     } q8_1_cache;
 
-    // src1 of the quantized mat-vec that reads the result of the flash attention node to run, see ggml_cuda_q8_1_consumer
-    const ggml_tensor * fattn_q8_1_src1 = nullptr;
+    // src1 of the quantized mat-vec that reads the result of the node to run, for the ops whose kernel can write the q8_1
+    // copy of its result (flash attention, MUL of rows with one factor per row), see ggml_cuda_q8_1_consumer
+    const ggml_tensor * node_q8_1_src1 = nullptr;
 
     // The compact ids and tiles that ggml_cuda_launch_mm_ids_helper makes for a MUL_MAT_ID (MMQ): the gate, up and down
     // projections of a MoE layer read the same ids, so the helper runs once per ids tensor.

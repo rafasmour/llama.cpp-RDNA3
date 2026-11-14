@@ -1392,7 +1392,7 @@ void launch_fattn(
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
         // The next quantized mat-vec reads the result as q8_1 blocks: write them here, into the cache that it looks up.
-        const ggml_tensor * q8_1_src1 = DV % QK8_1 == 0 && WARP_SIZE == QK8_1 ? ctx.fattn_q8_1_src1 : nullptr;
+        const ggml_tensor * q8_1_src1 = DV % QK8_1 == 0 && WARP_SIZE == QK8_1 ? ctx.node_q8_1_src1 : nullptr;
         if (q8_1_src1 != nullptr) {
             GGML_ASSERT(q8_1_src1->data == KQV->data && ggml_nelements(q8_1_src1) == ggml_nelements(KQV));
             int64_t q_args[8];

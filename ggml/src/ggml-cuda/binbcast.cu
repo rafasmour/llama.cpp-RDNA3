@@ -1,5 +1,6 @@
 #include "binbcast.cuh"
 #include "convert.cuh"
+#include "mmvq.cuh"
 #include <cstdint>
 #include <utility>
 
@@ -448,6 +449,11 @@ void ggml_cuda_op_sub(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ctx.node_q8_1_src1 != nullptr && ggml_cuda_can_mul_row_factor_q8_1(dst)) {
+        // the next quantized mat-vec reads the product: the kernel also writes its q8_1 copy
+        ggml_cuda_op_mul_row_factor_q8_1(ctx, dst, ctx.node_q8_1_src1);
+        return;
+    }
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_mul>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }
 
@@ -583,4 +589,69 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         default:
             GGML_ASSERT(false);
     }
+}
+
+#define CUDA_MUL_ROW_FACTOR_BLOCK_SIZE 256
+
+// dst[i] = a[i] * b[i / n]: one factor per row of n values (the gate per attention head of LFM2). The kernel also writes
+// the result as q8_1 blocks, as quantize_q8_1 would for the mat-vec that reads it in rows of ne0 values
+// (ne0 and k are multiples of QK8_1, so a warp holds the values of one block; a row of the copy has row_blocks blocks)
+static __global__ void mul_row_factor_q8_1_f32(const float * a, const float * b, float * dst, const uint32_t k, const uint32_t n,
+                                               const uint32_t ne0, const uint32_t row_blocks, void * q8_1) {
+    ggml_cuda_pdl_lc();
+    const uint32_t i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    const float v = a[i] * b[i / n];
+    dst[i] = v;
+
+    // same arithmetic as quantize_q8_1
+    const float  amax = warp_reduce_max<QK8_1>(fabsf(v));
+    const float  d    = amax / 127.0f;
+    const int8_t q    = amax == 0.0f ? 0 : roundf(v / d);
+    const int    sum  = warp_reduce_sum<QK8_1>((int) q);
+
+    const uint32_t row = i / ne0;
+    block_q8_1 *   y   = (block_q8_1 *) q8_1 + row * row_blocks + (i - row * ne0) / QK8_1;
+    const int      iqs = i % QK8_1;
+    y->qs[iqs] = q;
+    if (iqs == 0) {
+        y->ds = make_half2(d, d * sum);
+    }
+}
+
+bool ggml_cuda_can_mul_row_factor_q8_1(const ggml_tensor * mul) {
+    const ggml_tensor * a = mul->src[0];
+    const ggml_tensor * b = mul->src[1];
+    return mul->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && ggml_nelements(mul) < INT32_MAX &&
+           ggml_is_contiguous(mul) && ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_are_same_shape(mul, a) &&
+           a->ne[0] > 1 && b->ne[0] == 1 && b->ne[1] == a->ne[1] && b->ne[2] == a->ne[2] && b->ne[3] == a->ne[3];
+}
+
+void ggml_cuda_op_mul_row_factor_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * mul, const ggml_tensor * q8_1_src1) {
+    const ggml_tensor * a = mul->src[0];
+    const ggml_tensor * b = mul->src[1];
+    const int64_t       k = ggml_nelements(mul);
+
+    GGML_ASSERT(q8_1_src1->data == mul->data && ggml_nelements(q8_1_src1) == k && q8_1_src1->ne[0] % QK8_1 == 0);
+
+    // The next quantized mat-vec reads the result as q8_1 blocks: write them here, into the cache that it looks up.
+    int64_t q_args[8];
+    ggml_cuda_mmvq_q8_1_args(q8_1_src1, q_args);
+    ctx.q8_1_cache.clear();
+    ctx.q8_1_cache.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(
+        ctx.pool(), q_args[7]*q_args[6]*q_args[5]*q_args[4] * sizeof(block_q8_1) / QK8_1);
+
+    const dim3 blocks((k + CUDA_MUL_ROW_FACTOR_BLOCK_SIZE - 1) / CUDA_MUL_ROW_FACTOR_BLOCK_SIZE, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params(blocks, CUDA_MUL_ROW_FACTOR_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(mul_row_factor_q8_1_f32, launch_params,
+        (const float *) a->data, (const float *) b->data, (float *) mul->data, (uint32_t) k, (uint32_t) a->ne[0],
+        (uint32_t) q8_1_src1->ne[0], (uint32_t) (q_args[4] / QK8_1), (void *) ctx.q8_1_cache.buf->get());
+
+    ctx.q8_1_cache.set(q8_1_src1, q_args, mul);
 }

@@ -5008,6 +5008,47 @@ struct test_ssm_conv_mul_mat : public test_case {
     }
 };
 
+// GGML_OP_MUL of rows with one factor per row, read by a mat-mul (the gate per attention head of LFM2):
+// backends may quantize the activations in the kernel of the product
+struct test_mul_row_factor_mul_mat : public test_case {
+    const ggml_type type_a; // weights of the mat-mul
+    const int64_t n;        // values per row
+    const int64_t h;        // rows per token
+    const int64_t n_t;
+
+    test_mul_row_factor_mul_mat(ggml_type type_a, int64_t n, int64_t h, int64_t n_t)
+        : type_a(type_a), n(n), h(h), n_t(n_t) {}
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_a, n, h, n_t);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_ROW_FACTOR_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, h, n_t);
+        ggml_tensor * g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, h, n_t);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, n*h, 33);
+        ggml_set_name(x, "x");
+        ggml_set_name(g, "g");
+        ggml_set_name(a, "a");
+
+        ggml_tensor * y   = ggml_reshape_2d(ctx, ggml_mul(ctx, x, g), n*h, n_t);
+        ggml_tensor * out = ggml_mul_mat(ctx, a, y);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -12338,6 +12379,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         test_cases.emplace_back(new test_ssm_conv_mul_mat(type_a, 4, 2048, 40, 1));
+    }
+
+    // rows times one factor per row + mat-mul: 768 values per token (12 rows) are not a multiple of the row padding of the
+    // quantized activations (512), 10 tokens are past the mat-vec kernels
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (int64_t h : {12, 16, 32}) {
+            for (int64_t n_t : {1, 5, 10}) {
+                test_cases.emplace_back(new test_mul_row_factor_mul_mat(type_a, 64, h, n_t));
+            }
+        }
     }
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
