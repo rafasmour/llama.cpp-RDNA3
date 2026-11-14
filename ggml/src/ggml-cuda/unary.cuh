@@ -156,3 +156,8 @@ __device__ __forceinline__ float ggml_cuda_op_glu_single(ggml_glu_op op, float g
             return up * gate;
     }
 }
+
+// The activation scale in front of a MUL_MAT_ID (abs, max pool over each row, scale, log, scale, ceil, clamp, scale, exp,
+// div) in one kernel: e gets exp(s2 * clamp(ceil(s1 * log(s0 * max|x|)), lo, hi)) per row of x, dst = x / e.
+void ggml_cuda_op_amax_scale(ggml_backend_cuda_context & ctx, const ggml_tensor * x, ggml_tensor * e, ggml_tensor * dst,
+                             float s0, float s1, float lo, float hi, float s2);

@@ -5987,6 +5987,57 @@ struct test_mul_mat_shared_input : public test_case {
     }
 };
 
+// The activation scale in front of an expert down projection (llm_graph_context::build_amax_src1_f16): every row is divided
+// by e = 2^ceil(log2(max|x| / 1024)), kept in [1, 2^127], and e is used again behind the mat-mul.
+// Backends may run the chain abs, max pool, scale, log, scale, ceil, clamp, scale, exp, div as one kernel.
+struct test_amax_scale : public test_case {
+    const int64_t n;      // values per row
+    const int64_t n_used; // rows per token
+    const int64_t n_t;
+    const float   amp;    // range of the input values
+
+    test_amax_scale(int64_t n, int64_t n_used, int64_t n_t, float amp)
+        : n(n), n_used(n_used), n_t(n_t), amp(amp) {}
+
+    std::string vars() override {
+        return VARS_TO_STR4(n, n_used, n_t, amp);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "AMAX_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, n_used, n_t);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * e = ggml_pool_1d(ctx, ggml_abs(ctx, x), GGML_OP_POOL_MAX, n, n, 0);
+        e = ggml_scale(ctx, e, 1.0f/1024.0f);
+        e = ggml_log  (ctx, e);
+        e = ggml_scale(ctx, e, 1.4426950408889634f);
+        e = ggml_ceil (ctx, e);
+        e = ggml_clamp(ctx, e, 0.0f, 127.0f);
+        e = ggml_scale(ctx, e, 0.6931471805599453f);
+        e = ggml_exp  (ctx, e);
+
+        ggml_tensor * res = ggml_div(ctx, x, e);
+
+        // both results: the scaled rows and the rows times the scale
+        ggml_tensor * out = ggml_add(ctx, res, ggml_mul(ctx, res, e));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -amp, amp);
+        }
+    }
+};
+
 // FP4 W4A8 path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_w4a8 : public test_mul_mat {
     test_mul_mat_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -12493,6 +12544,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 512, 1, 512));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 32, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 256, 512, 256)); // many rows
+    // activation scale of expert rows: values that need no scale (e = 1), a scale of 32 and of 4096; rows shorter and
+    // longer than a thread block, one row and several per token, one token and a batch
+    for (float amp : {1.0f, 20000.0f, 3.0e6f}) {
+        for (int64_t n : {64, 896, 2304}) {
+            for (int64_t n_used : {1, 8}) {
+                for (int64_t n_t : {1, 5, 64}) {
+                    test_cases.emplace_back(new test_amax_scale(n, n_used, n_t, amp));
+                }
+            }
+        }
+    }
+
     // mat-muls on one input, small and large batches, float and quantized weights; the last shape is one that backends
     // may run as a float matrix product on dequantized weights
     for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
