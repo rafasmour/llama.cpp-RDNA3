@@ -4960,6 +4960,54 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// GGML_OP_SSM_CONV + GGML_OP_MUL with a gate of the same shape, read by a mat-mul (the short conv of LFM2):
+// backends may do the product in the conv kernel and quantize the activations there
+struct test_ssm_conv_mul_mat : public test_case {
+    const ggml_type type_a; // weights of the mat-mul
+    const int64_t d_conv;
+    const int64_t d_inner;
+    const int64_t n_t;
+    const int64_t n_s;
+
+    test_ssm_conv_mul_mat(ggml_type type_a, int64_t d_conv, int64_t d_inner, int64_t n_t, int64_t n_s)
+        : type_a(type_a), d_conv(d_conv), d_inner(d_inner), n_t(n_t), n_s(n_s) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, d_conv, d_inner, n_t, n_s);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // as in the model, the gate is the middle third of the rows of a wider tensor
+        ggml_tensor * bcx = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3*d_inner, n_t, n_s);
+        ggml_tensor * x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1 + n_t, d_inner, n_s);
+        ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner);
+        ggml_tensor * a   = ggml_new_tensor_2d(ctx, type_a, d_inner, 33);
+        ggml_set_name(bcx, "bcx");
+        ggml_set_name(x, "x");
+        ggml_set_name(w, "w");
+        ggml_set_name(a, "a");
+
+        ggml_tensor * c = ggml_view_3d(ctx, bcx, d_inner, n_t, n_s, bcx->nb[1], bcx->nb[2], d_inner * ggml_element_size(bcx));
+        ggml_tensor * y = ggml_mul(ctx, c, ggml_ssm_conv(ctx, x, w));
+        y = ggml_reshape_2d(ctx, y, d_inner, n_t * n_s);
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, y);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -12255,6 +12303,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}, fuse_bias));
             }
         }
+    }
+
+    // ssm_conv + product with a gate + mat-mul: 768 is not a multiple of the row padding of the quantized activations (512),
+    // 10 tokens (5 x 2) are past the mat-vec kernels, 40 tokens past the short conv kernel
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (int64_t d_conv : {3, 4}) {
+            for (int64_t d_inner : {768, 1024, 2048}) {
+                for (int64_t n_t : {1, 5}) {
+                    for (int64_t n_s : {1, 2}) {
+                        test_cases.emplace_back(new test_ssm_conv_mul_mat(type_a, d_conv, d_inner, n_t, n_s));
+                    }
+                }
+            }
+        }
+        test_cases.emplace_back(new test_ssm_conv_mul_mat(type_a, 4, 2048, 40, 1));
     }
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1

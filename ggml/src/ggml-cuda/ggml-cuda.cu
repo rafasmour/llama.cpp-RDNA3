@@ -4319,6 +4319,14 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_MUL) {
+        if (!ggml_cuda_can_ssm_conv_mul(cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1])) {
+            return false;
+        }
+        int out_nodes[] = { node_idx + 1 };
+        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+    }
+
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_ADD
      && ops.begin()[2] == GGML_OP_UNARY && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
@@ -5516,6 +5524,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, /*bias_add_node=*/ nullptr, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
+    if (node->op == GGML_OP_SSM_CONV && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_MUL }, {})) {
+        ggml_cuda_op_ssm_conv_mul(*cuda_ctx, node, cgraph->nodes[i + 1], ggml_cuda_q8_1_consumer(cuda_ctx, cgraph, i + 1, true, true));
         return 1;
     }
 
