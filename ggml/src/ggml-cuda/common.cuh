@@ -1506,6 +1506,28 @@ struct ggml_backend_cuda_context {
             data = nullptr;
         }
     } mm_ids_cache;
+
+    // The F16 copy of the last F32 input of a gemm: the projections of a layer that read the same input (Q / K / V,
+    // gate / up) come one after another, the input is converted once.
+    struct ggml_cuda_f16_input_cache {
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
+        const void * data = nullptr;
+        int64_t      nelements = 0;
+        uintptr_t    src_end = 0; // the source memory range is [data, src_end)
+
+        bool matches(const ggml_tensor * src1) const {
+            return buf && data == src1->data && nelements == ggml_nelements(src1);
+        }
+
+        void set(const ggml_tensor * src1);
+        // drop the cache if the node writes the memory of the source
+        void invalidate_if_written(const ggml_tensor * node);
+
+        void clear() {
+            buf.reset();
+            data = nullptr;
+        }
+    } f16_input_cache;
 };
 
 struct ggml_cuda_mm_fusion_args_host {

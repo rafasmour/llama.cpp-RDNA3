@@ -812,6 +812,19 @@ void ggml_backend_cuda_context::ggml_cuda_mm_ids_cache::invalidate_if_written(co
     }
 }
 
+void ggml_backend_cuda_context::ggml_cuda_f16_input_cache::set(const ggml_tensor * src1) {
+    data      = src1->data;
+    nelements = ggml_nelements(src1);
+    src_end   = (uintptr_t) src1->data + ggml_backend_buft_get_alloc_size(src1->buffer->buft, src1);
+}
+
+void ggml_backend_cuda_context::ggml_cuda_f16_input_cache::invalidate_if_written(const ggml_tensor * node) {
+    if (buf && (uintptr_t) node->data < src_end &&
+        (uintptr_t) data < (uintptr_t) node->data + ggml_backend_buft_get_alloc_size(node->buffer->buft, node)) {
+        clear();
+    }
+}
+
 void ggml_backend_cuda_context::ggml_cuda_q8_1_cache::invalidate_if_written(const ggml_tensor * node) {
     if (node == writer) {
         // the node made the copy from the data that it wrote
@@ -1927,7 +1940,30 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_ptr = src0_alloc.get();
     }
 
-    if (src1->type == compute_type) {
+    // An F32 input is converted once for the gemms that read it one after another. Only for a tensor that lies in its
+    // buffer: the slices of pool memory that the MUL_MAT_ID fallback passes are written by no graph node, so an entry
+    // for them would never be invalidated.
+    bool src1_cached = false;
+    if constexpr (compute_type == GGML_TYPE_F16) {
+        const char * buf_base   = src1->buffer ? (const char *) ggml_backend_buffer_get_base(src1->buffer) : nullptr;
+        const bool   in_buffer  = buf_base != nullptr && (const char *) src1->data >= buf_base &&
+            (const char *) src1->data + ggml_nbytes(src1) <= buf_base + ggml_backend_buffer_get_size(src1->buffer);
+        if (ctx.curr_stream_no == 0 && in_buffer && src1->type == GGML_TYPE_F32 && ggml_is_contiguously_allocated(src1)) {
+            auto & cache = ctx.f16_input_cache;
+            if (!cache.matches(src1)) {
+                cache.clear();
+                cache.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ggml_nelements(src1) * sizeof(cuda_t));
+                traits::convert(src1->type)(src1->data, (cuda_t *) cache.buf->get(), ggml_nelements(src1), main_stream);
+                cache.set(src1);
+            }
+            src1_ptr    = (const cuda_t *) cache.buf->get();
+            src1_cached = true;
+        }
+    }
+
+    if (src1_cached) {
+        // converted above
+    } else if (src1->type == compute_type) {
         src1_ptr = (const cuda_t *) src1->data;
     } else {
         src1_alloc.alloc(ggml_nelements(src1));
@@ -5800,6 +5836,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 cuda_ctx->q8_1_cache.invalidate_if_written(node);
                 cuda_ctx->mm_ids_cache.invalidate_if_written(node);
+                cuda_ctx->f16_input_cache.invalidate_if_written(node);
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
@@ -5817,6 +5854,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                     for (int j = i + 1; j <= i + nodes_to_skip; j++) {
                         cuda_ctx->mm_ids_cache.invalidate_if_written(cgraph->nodes[j]);
+                        cuda_ctx->f16_input_cache.invalidate_if_written(cgraph->nodes[j]);
                     }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
@@ -5968,9 +6006,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     cuda_ctx->q8_1_cache.clear();
     cuda_ctx->mm_ids_cache.clear();
+    cuda_ctx->f16_input_cache.clear();
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
     cuda_ctx->q8_1_cache.clear();
     cuda_ctx->mm_ids_cache.clear();
+    cuda_ctx->f16_input_cache.clear();
 
     return GGML_STATUS_SUCCESS;
 }
