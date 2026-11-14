@@ -2399,6 +2399,63 @@ static const ggml_tensor * ggml_cuda_q8_1_consumer(const ggml_backend_cuda_conte
     return nullptr;
 }
 
+// The activation scale that llm_graph_context::build_amax_src1_f16 puts in front of a MUL_MAT_ID:
+// e = exp(s2 * clamp(ceil(s1 * log(s0 * maxpool(abs(x)))), lo, hi)) per row and x / e, ten nodes from the abs at i.
+static bool ggml_cuda_match_amax_scale(const ggml_cgraph * cgraph, int i) {
+    if (i + 9 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_op ops[] = { GGML_OP_UNARY, GGML_OP_POOL_1D, GGML_OP_SCALE, GGML_OP_LOG, GGML_OP_SCALE,
+                            GGML_OP_UNARY, GGML_OP_CLAMP, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_DIV };
+    // the scale is read again behind the mat-mul
+    const int outputs[] = { i + 8, i + 9 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 10, ops, outputs, 2)) {
+        return false;
+    }
+
+    ggml_tensor ** n = cgraph->nodes + i;
+    const ggml_tensor * x   = n[0]->src[0];
+    const ggml_tensor * e   = n[8];
+    const ggml_tensor * dst = n[9];
+
+    for (int k = 1; k <= 8; k++) {
+        if (n[k]->src[0] != n[k - 1] || n[k]->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    if (dst->src[0] != x || dst->src[1] != e || x->type != GGML_TYPE_F32 || n[0]->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (ggml_get_unary_op(n[0]) != GGML_UNARY_OP_ABS || ggml_get_unary_op(n[5]) != GGML_UNARY_OP_CEIL ||
+            ggml_get_unary_op(n[8]) != GGML_UNARY_OP_EXP) {
+        return false;
+    }
+
+    // one maximum per row
+    const int32_t * pool = (const int32_t *) n[1]->op_params;
+    if (pool[0] != GGML_OP_POOL_MAX || pool[1] != x->ne[0] || pool[2] != x->ne[0] || pool[3] != 0 || x->ne[0] > INT32_MAX) {
+        return false;
+    }
+    for (int k : { 2, 4, 7 }) {
+        if (ggml_get_op_params_f32(n[k], 1) != 0.0f) {
+            return false;
+        }
+    }
+
+    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(e) || !ggml_is_contiguous(dst) || !ggml_are_same_shape(x, dst) ||
+            ggml_nelements(e) != ggml_nrows(x)) {
+        return false;
+    }
+
+    // the result may take the place of x, but the scale has to lie apart from both
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    return (dst->data == x->data || !overlap(dst, x)) && !overlap(e, x) && !overlap(e, dst);
+}
+
 static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
     if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
         return false;
@@ -5639,6 +5696,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_op_sigmoid_gate_add(*cuda_ctx, gate, shexp, moe, res, cgraph->nodes[i + 3]);
             return 3;
         }
+    }
+
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_ABS && ggml_cuda_match_amax_scale(cgraph, i)) {
+        ggml_tensor ** n = cgraph->nodes + i;
+        ggml_cuda_op_amax_scale(*cuda_ctx, node->src[0], n[8], n[9],
+            ggml_get_op_params_f32(n[2], 0), ggml_get_op_params_f32(n[4], 0),
+            ggml_get_op_params_f32(n[6], 0), ggml_get_op_params_f32(n[6], 1), ggml_get_op_params_f32(n[7], 0));
+        return 9;
     }
 
     if (node->op == GGML_OP_CONT && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID })) {

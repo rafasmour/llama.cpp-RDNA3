@@ -957,3 +957,58 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+/* activation scale in front of a MUL_MAT_ID (llm_graph_context::build_amax_src1_f16) */
+
+#define CUDA_AMAX_SCALE_BLOCK_SIZE 256
+
+// For every row of n values: e = exp(s2 * clamp(ceil(s1 * log(s0 * max|x|)), lo, hi)) and dst = x / e.
+// These are the values of the chain abs, max pool over the row, scale, log, scale, ceil, clamp, scale, exp and div,
+// with the same single precision operations in the same order. One block per row; a block reads its row before it
+// writes, so dst may be x.
+static __global__ void amax_scale_f32(const float * x, float * dst, float * e_dst, const int n,
+        const float s0, const float s1, const float lo, const float hi, const float s2) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    __shared__ float amax_warp[CUDA_AMAX_SCALE_BLOCK_SIZE / warp_size];
+
+    const float * xr = x   + (int64_t) blockIdx.x * n;
+    float *       dr = dst + (int64_t) blockIdx.x * n;
+
+    float amax = -FLT_MAX; // as the pool kernel starts
+    for (int i = threadIdx.x; i < n; i += CUDA_AMAX_SCALE_BLOCK_SIZE) {
+        amax = max(amax, fabsf(xr[i]));
+    }
+    amax = warp_reduce_max<warp_size>(amax);
+    if (threadIdx.x % warp_size == 0) {
+        amax_warp[threadIdx.x / warp_size] = amax;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int w = 0; w < CUDA_AMAX_SCALE_BLOCK_SIZE / warp_size; w++) {
+        amax = max(amax, amax_warp[w]);
+    }
+
+    const float e = expf(s2 * fminf(fmaxf(ceilf(s1 * logf(s0 * amax)), lo), hi));
+
+    if (threadIdx.x == 0) {
+        e_dst[blockIdx.x] = e;
+    }
+    for (int i = threadIdx.x; i < n; i += CUDA_AMAX_SCALE_BLOCK_SIZE) {
+        dr[i] = xr[i] / e;
+    }
+}
+
+void ggml_cuda_op_amax_scale(ggml_backend_cuda_context & ctx, const ggml_tensor * x, ggml_tensor * e, ggml_tensor * dst,
+                             const float s0, const float s1, const float lo, const float hi, const float s2) {
+    const int64_t n    = x->ne[0];
+    const int64_t rows = ggml_nrows(x);
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && e->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(e) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(x, dst) && ggml_nelements(e) == rows && n <= INT32_MAX);
+
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params(dim3(rows, 1, 1), CUDA_AMAX_SCALE_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(amax_scale_f32, launch_params,
+        (const float *) x->data, (float *) dst->data, (float *) e->data, (int) n, s0, s1, lo, hi, s2);
+}
