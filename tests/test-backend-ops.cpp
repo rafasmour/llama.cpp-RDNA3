@@ -13008,6 +13008,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
     }
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
+    // several quantized mat-muls of one layer with the same ids (backends may reuse the layout that they derive from the ids):
+    // batches for the mat-mul kernels, the input broadcast across the experts or not, skipped ids
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (int64_t bs : {16, 64}) {
+            for (bool bcast : {false, true}) {
+                for (bool skip : {false, true}) {
+                    test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 16, 4, bcast, 64, bs, 256, 3, false, skip));
+                }
+            }
+        }
+    }
     for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
         for (int64_t n : { 1, 2, 3, 4, 8, 9 }) {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
