@@ -799,6 +799,19 @@ void ggml_backend_cuda_context::ggml_cuda_q8_1_cache::set(const ggml_tensor * sr
     memcpy(args, a, sizeof(args));
 }
 
+void ggml_backend_cuda_context::ggml_cuda_mm_ids_cache::set(const ggml_tensor * ids, const int64_t (& a)[8]) {
+    data    = ids->data;
+    src_end = (uintptr_t) ids->data + ggml_backend_buft_get_alloc_size(ids->buffer->buft, ids);
+    memcpy(args, a, sizeof(args));
+}
+
+void ggml_backend_cuda_context::ggml_cuda_mm_ids_cache::invalidate_if_written(const ggml_tensor * node) {
+    if (ids_src1 && (uintptr_t) node->data < src_end &&
+        (uintptr_t) data < (uintptr_t) node->data + ggml_backend_buft_get_alloc_size(node->buffer->buft, node)) {
+        clear();
+    }
+}
+
 void ggml_backend_cuda_context::ggml_cuda_q8_1_cache::invalidate_if_written(const ggml_tensor * node) {
     if (node == writer) {
         // the node made the copy from the data that it wrote
@@ -5781,6 +5794,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 cuda_ctx->q8_1_cache.invalidate_if_written(node);
+                cuda_ctx->mm_ids_cache.invalidate_if_written(node);
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
@@ -5795,6 +5809,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                     for (int j = j_first; j <= i + nodes_to_skip; j++) {
                         cuda_ctx->q8_1_cache.invalidate_if_written(cgraph->nodes[j]);
+                    }
+                    for (int j = i + 1; j <= i + nodes_to_skip; j++) {
+                        cuda_ctx->mm_ids_cache.invalidate_if_written(cgraph->nodes[j]);
                     }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
@@ -5944,8 +5961,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     cuda_ctx->q8_1_cache.clear();
+    cuda_ctx->mm_ids_cache.clear();
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
     cuda_ctx->q8_1_cache.clear();
+    cuda_ctx->mm_ids_cache.clear();
 
     return GGML_STATUS_SUCCESS;
 }

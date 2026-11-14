@@ -1479,6 +1479,32 @@ struct ggml_backend_cuda_context {
 
     // src1 of the quantized mat-vec that reads the result of the flash attention node to run, see ggml_cuda_q8_1_consumer
     const ggml_tensor * fattn_q8_1_src1 = nullptr;
+
+    // The compact ids and tiles that ggml_cuda_launch_mm_ids_helper makes for a MUL_MAT_ID (MMQ): the gate, up and down
+    // projections of a MoE layer read the same ids, so the helper runs once per ids tensor.
+    struct ggml_cuda_mm_ids_cache {
+        std::unique_ptr<ggml_cuda_pool_alloc<int32_t>> ids_src1;
+        std::unique_ptr<ggml_cuda_pool_alloc<int32_t>> ids_dst;
+        std::unique_ptr<ggml_cuda_pool_alloc<char>>    tile_spec;
+        const void * data = nullptr;
+        int64_t      args[8] = {}; // n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse
+        uintptr_t    src_end = 0; // the memory range of the ids is [data, src_end)
+
+        bool matches(const ggml_tensor * ids, const int64_t (& a)[8]) const {
+            return ids_src1 && data == ids->data && memcmp(args, a, sizeof(args)) == 0;
+        }
+
+        void set(const ggml_tensor * ids, const int64_t (& a)[8]);
+        // drop the cache if the node writes the memory of the ids
+        void invalidate_if_written(const ggml_tensor * node);
+
+        void clear() {
+            ids_src1.reset();
+            ids_dst.reset();
+            tile_spec.reset();
+            data = nullptr;
+        }
+    } mm_ids_cache;
 };
 
 struct ggml_cuda_mm_fusion_args_host {
