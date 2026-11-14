@@ -325,6 +325,33 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 // dst[row] = { src0[row][0..n0), src1[row][0..n1) }, store[row] = the last n0 elements of dst[row].
 // One thread per row; store may be the memory that src0 is read from, so a thread reads its src0 row before it writes.
+// a: the src0 row, src1_at(t): element t of the src1 row, d: the dst row, st: the store row
+template <typename F>
+static __device__ __forceinline__ void concat_dim0_store_row(const float * a, const F & src1_at, float * d, float * st, const int n0, const int n1) {
+    float head[CUDA_CONCAT_STORE_MAX_HEAD];
+#pragma unroll
+    for (int k = 0; k < CUDA_CONCAT_STORE_MAX_HEAD; ++k) {
+        head[k] = k < n0 ? a[k] : 0.0f;
+    }
+
+#pragma unroll
+    for (int k = 0; k < CUDA_CONCAT_STORE_MAX_HEAD; ++k) {
+        if (k < n0) {
+            d[k] = head[k];
+        }
+    }
+    for (int t = 0; t < n1; ++t) {
+        d[n0 + t] = src1_at(t);
+    }
+#pragma unroll
+    for (int k = 0; k < CUDA_CONCAT_STORE_MAX_HEAD; ++k) {
+        if (k < n0) {
+            const int j = n1 + k; // column of the result
+            st[k] = j < n0 ? head[j] : src1_at(j - n0);
+        }
+    }
+}
+
 static __global__ void concat_dim0_store_f32(
         const float * src0, const float * src1, float * dst, float * store,
         const int n0, const int n1, const int nrows,
@@ -336,34 +363,29 @@ static __global__ void concat_dim0_store_f32(
         return;
     }
 
-    const float * a = src0 + seq * s0_2 + (int64_t) row * n0;
     const float * b = src1 + seq * s1_2 + (int64_t) row * s1_1;
 
-    float head[CUDA_CONCAT_STORE_MAX_HEAD];
-#pragma unroll
-    for (int k = 0; k < CUDA_CONCAT_STORE_MAX_HEAD; ++k) {
-        head[k] = k < n0 ? a[k] : 0.0f;
+    concat_dim0_store_row(src0 + seq * s0_2 + (int64_t) row * n0, [&](const int t) { return b[t * s1_0]; },
+        dst + seq * dst_2 + (int64_t) row * (n0 + n1), store + seq * store_2 + (int64_t) row * n0, n0, n1);
+}
+
+// the same with src1 = the product of two tensors with the same strides (B * x of the LFM2 short conv)
+static __global__ void concat_dim0_mul_store_f32(
+        const float * src0, const float * src1, const float * src1_mul, float * dst, float * store,
+        const int n0, const int n1, const int nrows,
+        const int64_t s0_2, const int64_t s1_0, const int64_t s1_1, const int64_t s1_2,
+        const int64_t dst_2, const int64_t store_2) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int seq = blockIdx.y;
+    if (row >= nrows) {
+        return;
     }
 
-    float * d  = dst   + seq * dst_2   + (int64_t) row * (n0 + n1);
-    float * st = store + seq * store_2 + (int64_t) row * n0;
+    const float * b = src1     + seq * s1_2 + (int64_t) row * s1_1;
+    const float * m = src1_mul + seq * s1_2 + (int64_t) row * s1_1;
 
-#pragma unroll
-    for (int k = 0; k < CUDA_CONCAT_STORE_MAX_HEAD; ++k) {
-        if (k < n0) {
-            d[k] = head[k];
-        }
-    }
-    for (int t = 0; t < n1; ++t) {
-        d[n0 + t] = b[t * s1_0];
-    }
-#pragma unroll
-    for (int k = 0; k < CUDA_CONCAT_STORE_MAX_HEAD; ++k) {
-        if (k < n0) {
-            const int j = n1 + k; // column of the result
-            st[k] = j < n0 ? head[j] : b[(j - n0) * s1_0];
-        }
-    }
+    concat_dim0_store_row(src0 + seq * s0_2 + (int64_t) row * n0, [&](const int t) { return b[t * s1_0] * m[t * s1_0]; },
+        dst + seq * dst_2 + (int64_t) row * (n0 + n1), store + seq * store_2 + (int64_t) row * n0, n0, n1);
 }
 
 bool ggml_cuda_can_concat_store(const ggml_tensor * concat, const ggml_tensor * view, const ggml_tensor * cpy) {
@@ -402,7 +424,22 @@ bool ggml_cuda_can_concat_store(const ggml_tensor * concat, const ggml_tensor * 
     return src1->nb[0] % sizeof(float) == 0 && src1->nb[1] % sizeof(float) == 0 && src1->nb[2] % sizeof(float) == 0;
 }
 
-void ggml_cuda_op_concat_store(ggml_backend_cuda_context & ctx, ggml_tensor * concat, ggml_tensor * cpy) {
+bool ggml_cuda_can_concat_store_mul(const ggml_tensor * concat, const ggml_tensor * mul) {
+    const ggml_tensor * src1 = concat->src[1];
+    const ggml_tensor * a    = mul->src[0];
+    const ggml_tensor * b    = mul->src[1];
+
+    // src1 is the transposed product, the factors have the shape and the strides of each other
+    if (src1->op != GGML_OP_TRANSPOSE || src1->src[0] != mul || src1->data != mul->data ||
+            mul->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || mul->ne[3] != 1 ||
+            !ggml_are_same_shape(mul, a) || !ggml_are_same_shape(mul, b)) {
+        return false;
+    }
+    return a->nb[0] == sizeof(float) && a->nb[1] % sizeof(float) == 0 && a->nb[2] % sizeof(float) == 0 &&
+           a->nb[0] == b->nb[0] && a->nb[1] == b->nb[1] && a->nb[2] == b->nb[2];
+}
+
+void ggml_cuda_op_concat_store(ggml_backend_cuda_context & ctx, ggml_tensor * concat, ggml_tensor * cpy, const ggml_tensor * mul) {
     const ggml_tensor * src0 = concat->src[0];
     const ggml_tensor * src1 = concat->src[1];
 
@@ -413,6 +450,18 @@ void ggml_cuda_op_concat_store(ggml_backend_cuda_context & ctx, ggml_tensor * co
 
     const dim3 block_nums((nrows + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE, nseqs, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, CUDA_CONCAT_BLOCK_SIZE, 0, ctx.stream());
+    if (mul != nullptr) {
+        // the factors are read where the transposed product would be: dims 0 and 1 swapped
+        const ggml_tensor * a = mul->src[0];
+        const ggml_tensor * b = mul->src[1];
+        ggml_cuda_kernel_launch(concat_dim0_mul_store_f32, launch_params,
+            (const float *) src0->data, (const float *) a->data, (const float *) b->data, (float *) concat->data, (float *) cpy->data,
+            n0, n1, nrows,
+            (int64_t) (src0->nb[2] / sizeof(float)),
+            (int64_t) (a->nb[1] / sizeof(float)), (int64_t) (a->nb[0] / sizeof(float)), (int64_t) (a->nb[2] / sizeof(float)),
+            (int64_t) (concat->nb[2] / sizeof(float)), (int64_t) (cpy->nb[1] / sizeof(float)));
+        return;
+    }
     ggml_cuda_kernel_launch(concat_dim0_store_f32, launch_params,
         (const float *) src0->data, (const float *) src1->data, (float *) concat->data, (float *) cpy->data,
         n0, n1, nrows,

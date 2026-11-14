@@ -8609,12 +8609,13 @@ struct test_concat_state_store : public test_case {
     const int64_t n_tokens;
     const int64_t n_channels;
     const int64_t n_seqs;
+    const bool    product; // the new input is the product of two parts of a wider tensor
 
-    test_concat_state_store(int64_t n_state, int64_t n_tokens, int64_t n_channels, int64_t n_seqs)
-        : n_state(n_state), n_tokens(n_tokens), n_channels(n_channels), n_seqs(n_seqs) {}
+    test_concat_state_store(int64_t n_state, int64_t n_tokens, int64_t n_channels, int64_t n_seqs, bool product = false)
+        : n_state(n_state), n_tokens(n_tokens), n_channels(n_channels), n_seqs(n_seqs), product(product) {}
 
     std::string vars() override {
-        return VARS_TO_STR4(n_state, n_tokens, n_channels, n_seqs);
+        return VARS_TO_STR5(n_state, n_tokens, n_channels, n_seqs, product);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -8628,13 +8629,20 @@ struct test_concat_state_store : public test_case {
         // the state cells of all sequences, with one unused cell in front
         ggml_tensor * cells = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state * n_channels, n_seqs + 1);
         ggml_set_name(cells, "cells");
-        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_channels, n_tokens, n_seqs);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, (product ? 3 : 1) * n_channels, n_tokens, n_seqs);
         ggml_set_name(x, "x");
 
         ggml_tensor * state = ggml_view_2d(ctx, cells, n_state * n_channels, n_seqs, cells->nb[1], cells->nb[1]);
         state = ggml_reshape_3d(ctx, state, n_state, n_channels, n_seqs);
 
-        ggml_tensor * xt = ggml_permute(ctx, x, 1, 0, 2, 3); // [n_tokens, n_channels, n_seqs]
+        ggml_tensor * xt;
+        if (product) {
+            ggml_tensor * b = ggml_view_3d(ctx, x, n_channels, n_tokens, n_seqs, x->nb[1], x->nb[2], 0);
+            ggml_tensor * c = ggml_view_3d(ctx, x, n_channels, n_tokens, n_seqs, x->nb[1], x->nb[2], 2 * n_channels * ggml_element_size(x));
+            xt = ggml_transpose(ctx, ggml_mul(ctx, b, c)); // [n_tokens, n_channels, n_seqs]
+        } else {
+            xt = ggml_permute(ctx, x, 1, 0, 2, 3); // [n_tokens, n_channels, n_seqs]
+        }
 
         ggml_tensor * conv_x = ggml_concat(ctx, state, xt, 0);
 
@@ -12618,6 +12626,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_concat_state_store(3, 1, 8192, 1));
     test_cases.emplace_back(new test_concat_state_store(3, 1, 8192, 4));
+    for (int64_t n_tokens : {1, 2, 5, 8, 9}) {
+        for (int64_t n_seqs : {1, 3}) {
+            test_cases.emplace_back(new test_concat_state_store(2, n_tokens, 2048, n_seqs, true));
+            test_cases.emplace_back(new test_concat_state_store(3, n_tokens,  300, n_seqs, true));
+        }
+    }
 
     // output gate of a block followed by the quantized output projection
     for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
