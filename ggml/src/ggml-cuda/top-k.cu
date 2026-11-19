@@ -194,10 +194,7 @@ static __global__ void top_k_radix_gather(
     constexpr int NBINS     = 1 << RADIX_BITS;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = BLOCK_SIZE / warp_size;
-    using lane_mask_t = std::conditional_t<warp_size == 64, uint64_t, uint32_t>;
-    // HIP requires a 64-bit mask also for a 32-wide warp
-    constexpr uint64_t ballot_mask = ~(lane_mask_t) 0;
-    const auto popc = [](const lane_mask_t mask) {
+    const auto popc = [](const ggml_cuda_thread_mask_t mask) {
         if constexpr (warp_size == 64) {
             return __popcll(mask);
         } else {
@@ -259,8 +256,8 @@ static __global__ void top_k_radix_gather(
         const int64_t col    = tile + lane;
         const bool    is_tie = col < warp_end && top_k_float_to_ordered(row_src[col]) == threshold;
 
-        const lane_mask_t ties    = (lane_mask_t) __ballot_sync(ballot_mask, is_tie);
-        const int         tie_pos = pos + popc(ties & (((lane_mask_t) 1 << lane) - 1));
+        const ggml_cuda_thread_mask_t ties = ggml_cuda_ballot(is_tie);
+        const int tie_pos = pos + popc(ties & (((ggml_cuda_thread_mask_t) 1 << lane) - 1));
         if (is_tie && tie_pos < pos_end) {
             row_dst[k - rank + tie_pos] = col;
         }
@@ -323,8 +320,8 @@ static __device__ __forceinline__ uint64_t top_k_select_block_max(uint64_t x, ui
     constexpr int nwarps    = BLOCK_SIZE / warp_size;
 #pragma unroll
     for (int offset = warp_size/2; offset > 0; offset >>= 1) {
-        const uint32_t lo = __shfl_xor_sync(0xffffffff, (uint32_t) x, offset, warp_size);
-        const uint32_t hi = __shfl_xor_sync(0xffffffff, (uint32_t) (x >> 32), offset, warp_size);
+        const uint32_t lo = ggml_cuda_shfl_xor((uint32_t) x, offset, warp_size);
+        const uint32_t hi = ggml_cuda_shfl_xor((uint32_t) (x >> 32), offset, warp_size);
         const uint64_t y  = ((uint64_t) hi << 32) | lo;
         x = y > x ? y : x;
     }
