@@ -19,6 +19,25 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// optional bias added to the mask: table[indices[query, key], head, query], see ggml_flash_attn_ext_add_indexed_bias
+// table is offset to the first query of the sequence and to the first head of the block
+struct fattn_indexed_bias {
+    const float   * table;
+    const int32_t * indices;
+    int32_t n_bins;
+    int32_t n_keys;
+    int32_t n_head;
+
+    __device__ __forceinline__ fattn_indexed_bias offset(const int64_t query, const int head) const {
+        return {table + (query*n_head + head)*n_bins, indices + query*n_keys, n_bins, n_keys, n_head};
+    }
+
+    __device__ __forceinline__ float get(const int query, const int head, const int key) const {
+        const int bin = indices[int64_t(query)*n_keys + key];
+        return uint32_t(bin) < uint32_t(n_bins) ? table[(int64_t(query)*n_head + head)*n_bins + bin] : 0.0f;
+    }
+};
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -41,7 +60,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int64_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
+        const fattn_indexed_bias bias);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -1067,6 +1087,10 @@ void launch_fattn(
     const ggml_tensor * sinks   = dst->src[4];
     const ggml_tensor * kv_rows = dst->src[5];
 
+    const ggml_tensor * bias_table   = dst->src[6];
+    const ggml_tensor * bias_indices = dst->src[7];
+    GGML_ASSERT(!bias_table || (!use_sparse && ncols2 == 1 && mask && mask->ne[2] == 1));
+
     // with kv_rows the kernel iterates over the mask columns and reads K/V rows through kv_rows
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : K->ne[1];
     GGML_ASSERT(!kv_rows || !use_sparse);
@@ -1345,7 +1369,13 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        fattn_indexed_bias{
+            bias_table   ? (const float   *) bias_table->data   : nullptr,
+            bias_indices ? (const int32_t *) bias_indices->data : nullptr,
+            bias_table   ? (int32_t) bias_table->ne[0]   : 0,
+            bias_indices ? (int32_t) bias_indices->ne[0] : 0,
+            (int32_t) Q->ne[2]}
     );
     CUDA_CHECK(cudaGetLastError());
 
