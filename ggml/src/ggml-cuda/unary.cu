@@ -940,6 +940,34 @@ void ggml_cuda_op_dot_sigmoid_gate_add(
         (int64_t) (moe->nb[1] / sizeof(float)), (int64_t) (res->nb[1] / sizeof(float)));
 }
 
+/* fused gate: dst = (cur - tanh(f)*cur) + tanh(g)*msg, the chain tanh, mul, sub, tanh, mul and add */
+
+static __global__ void tanh_gate_f32(const float * cur, const float * f, const float * g, const float * msg, float * dst, const int64_t k) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    dst[i] = (cur[i] - tanhf(f[i])*cur[i]) + tanhf(g[i])*msg[i];
+}
+
+bool ggml_cuda_should_fuse_tanh_gate(const ggml_tensor * cur, const ggml_tensor * f, const ggml_tensor * g, const ggml_tensor * msg, const ggml_tensor * dst) {
+    for (const ggml_tensor * t : { cur, f, g, msg, dst }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, dst)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void ggml_cuda_op_tanh_gate_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * cur, const ggml_tensor * f, const ggml_tensor * g,
+        const ggml_tensor * msg, ggml_tensor * dst) {
+    const int64_t k = ggml_nelements(dst);
+    const int64_t num_blocks = (k + CUDA_TANH_BLOCK_SIZE - 1) / CUDA_TANH_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+    tanh_gate_f32<<<num_blocks, CUDA_TANH_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const float *) cur->data, (const float *) f->data, (const float *) g->data, (const float *) msg->data, (float *) dst->data, k);
+}
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {

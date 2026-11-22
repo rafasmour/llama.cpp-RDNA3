@@ -450,6 +450,50 @@ static __global__ void l2_norm_f32(
     }
 }
 
+// the clip of l2 norms as one kernel: y = x*s, dst = y*clamp(c/(sqrt(sum(y*y))*a + b), lo, hi)
+// s is optional and is broadcast over the rows, channels and samples of x
+template <int block_size>
+static __global__ void l2_clip_f32(
+        const float * x, const float * s, float * dst, const int ncols, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const int s_nrows, const int s_nchannels, const int s_nsamples,
+        const float a, const float b, const float c, const float lo, const float hi) {
+    const int nrows = gridDim.x;
+    const int row   = blockIdx.x;
+    const int tid   = threadIdx.x;
+
+    extern __shared__ float s_sum[];
+
+    ggml_cuda_pdl_sync();
+
+    for (int sample = blockIdx.z; sample < nsamples; sample += gridDim.z) {
+        for (int channel = blockIdx.y; channel < nchannels; channel += gridDim.y) {
+            const float * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
+            float       * dstc = dst + ((int64_t(sample)*nchannels + channel)*nrows + row)*ncols;
+            const float * sc   = s ? s + ((int64_t(sample % s_nsamples)*s_nchannels + channel % s_nchannels)*s_nrows + row % s_nrows)*ncols : nullptr;
+
+            float tmp = 0.0f;
+            for (int col = tid; col < ncols; col += block_size) {
+                const float yi = sc ? xc[col]*sc[col] : xc[col];
+                tmp += yi * yi;
+            }
+
+            tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+            const float factor = fminf(fmaxf(c / (sqrtf(tmp)*a + b), lo), hi);
+
+            for (int col = tid; col < ncols; col += block_size) {
+                const float yi = sc ? xc[col]*sc[col] : xc[col];
+                dstc[col] = yi * factor;
+            }
+
+            if constexpr (block_size > WARP_SIZE) {
+                __syncthreads();
+            }
+        }
+    }
+}
+
 template <bool do_multiply = false, bool do_add = false>
 static void norm_f32_cuda(const float * x,
                           float *       dst,
@@ -717,6 +761,25 @@ static void l2_norm_f32_cuda(
         const dim3 block_dims(1024, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
         ggml_cuda_kernel_launch(l2_norm_f32<1024>, launch_params, x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps);
+    }
+}
+
+static void l2_clip_f32_cuda(
+        const float * x, const float * s, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const int s_nrows, const int s_nchannels, const int s_nsamples,
+        const float a, const float b, const float c, const float lo, const float hi, cudaStream_t stream) {
+    const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
+    if (ncols < 1024) {
+        const dim3 block_dims(WARP_SIZE, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 0, stream};
+        ggml_cuda_kernel_launch(l2_clip_f32<WARP_SIZE>, launch_params, x, s, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample,
+            s_nrows, s_nchannels, s_nsamples, a, b, c, lo, hi);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32 * sizeof(float), stream};
+        ggml_cuda_kernel_launch(l2_clip_f32<1024>, launch_params, x, s, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample,
+            s_nrows, s_nchannels, s_nsamples, a, b, c, lo, hi);
     }
 }
 
@@ -1070,4 +1133,29 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+// x: the input of SQR, scale: the factor of the MUL before it (or nullptr), then SCALE, FILL and CLAMP of the chain, dst: the last MUL
+bool ggml_cuda_should_fuse_l2_clip(const ggml_tensor * x, const ggml_tensor * scale, const ggml_tensor * dst) {
+    if (x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || !ggml_is_contiguous(dst) || !ggml_are_same_shape(x, dst)) {
+        return false;
+    }
+    if (scale && (scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || scale->ne[0] != x->ne[0] || !ggml_can_repeat(scale, x))) {
+        return false;
+    }
+    return x->ne[1] <= INT_MAX && x->ne[2] <= INT_MAX && x->ne[3] <= INT_MAX;
+}
+
+void ggml_cuda_op_l2_clip_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * scale,
+        const ggml_tensor * norm_scale, const ggml_tensor * fill, const ggml_tensor * clamp, ggml_tensor * dst) {
+    const float a  = ggml_get_op_params_f32(norm_scale, 0);
+    const float b  = ggml_get_op_params_f32(norm_scale, 1);
+    const float c  = ggml_get_op_params_f32(fill, 0);
+    const float lo = ggml_get_op_params_f32(clamp, 0);
+    const float hi = ggml_get_op_params_f32(clamp, 1);
+
+    const size_t ts = sizeof(float);
+    l2_clip_f32_cuda((const float *) x->data, scale ? (const float *) scale->data : nullptr, (float *) dst->data,
+        x->ne[0], x->ne[1], x->ne[2], x->ne[3], x->nb[1]/ts, x->nb[2]/ts, x->nb[3]/ts,
+        scale ? scale->ne[1] : 1, scale ? scale->ne[2] : 1, scale ? scale->ne[3] : 1, a, b, c, lo, hi, ctx.stream());
 }

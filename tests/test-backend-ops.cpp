@@ -4169,6 +4169,119 @@ struct test_rms_norm_back : public test_case {
     }
 };
 
+// clip of the row l2 norms as in Inkling 2: [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL
+struct test_l2_clip : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool with_scale;
+    const float threshold;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "L2_CLIP";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, with_scale, threshold);
+    }
+
+    test_l2_clip(std::array<int64_t, 4> ne = {128, 24, 7, 1}, bool with_scale = true, float threshold = 6.5f)
+        : ne(ne), with_scale(with_scale), threshold(threshold) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(x, "x");
+
+        ggml_tensor * cur = x;
+        if (with_scale) {
+            ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+            ggml_set_name(s, "s");
+            cur = ggml_mul(ctx, cur, s);
+        }
+
+        ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, cur)));
+        norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
+
+        ggml_tensor * factor = ggml_div(ctx, ggml_fill(ctx, norm, threshold), norm);
+
+        ggml_tensor * out = ggml_mul(ctx, cur, ggml_clamp(ctx, factor, 0.0f, 1.0f));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// gate as in Inkling 2: (cur - tanh(f)*cur) + tanh(g)*msg
+struct test_tanh_gate : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "TANH_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_tanh_gate(std::array<int64_t, 4> ne = {2304, 7, 1, 1}) : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * f   = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * g   = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * msg = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(cur, "cur");
+        ggml_set_name(f,   "f");
+        ggml_set_name(g,   "g");
+        ggml_set_name(msg, "msg");
+
+        ggml_tensor * gain   = ggml_tanh(ctx, g);
+        ggml_tensor * forget = ggml_tanh(ctx, f);
+
+        ggml_tensor * out = ggml_add(ctx, ggml_sub(ctx, cur, ggml_mul(ctx, forget, cur)), ggml_mul(ctx, gain, msg));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// GGML_OP_ADD + GGML_OP_SCALE of two tensors of the same shape
+struct test_add_scale : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float scale;
+    const float bias;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, scale, bias);
+    }
+
+    test_add_scale(std::array<int64_t, 4> ne = {2304, 7, 1, 1}, float scale = 0.3f, float bias = 0.0f)
+        : ne(ne), scale(scale), bias(bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_scale_bias(ctx, ggml_add(ctx, a, b), scale, bias);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
@@ -14527,6 +14640,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 8, 2, 4096, 1280, nb, n_slices));
         }
     }
+
+    // fused element-wise chains of Inkling 2
+    for (bool with_scale : {false, true}) {
+        test_cases.emplace_back(new test_l2_clip({128, 24, 7, 1}, with_scale));
+        test_cases.emplace_back(new test_l2_clip({ 16, 24, 1, 1}, with_scale, 1.0f));
+        test_cases.emplace_back(new test_l2_clip({128,  8, 3, 2}, with_scale, 100.0f));
+        test_cases.emplace_back(new test_l2_clip({1536, 3, 2, 1}, with_scale));
+    }
+    test_cases.emplace_back(new test_tanh_gate({2304, 1, 1, 1}));
+    test_cases.emplace_back(new test_tanh_gate({2304, 7, 1, 1}));
+    test_cases.emplace_back(new test_add_scale({2304, 1, 1, 1}));
+    test_cases.emplace_back(new test_add_scale({1024, 7, 2, 1}, 0.2f, 0.5f));
 
     // flash attention with an indexed bias (Inkling 2 relative-position bias)
     for (bool kv_rows : {false, true}) {
