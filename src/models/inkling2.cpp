@@ -238,6 +238,9 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
 
     if (dynamic) {
+        // the taps first, so that the element-wise tail of the convolution is one run of nodes
+        ggml_build_forward_expand(gf, dynamic);
+
         const int64_t n_heads = dynamic->ne[0]/n_conv;
 
         dynamic = ggml_reshape_3d(ctx0, dynamic, n_conv, n_heads, n_tokens);

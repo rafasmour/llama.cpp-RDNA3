@@ -4470,15 +4470,14 @@ ggml_tensor * llm_graph_context::build_attn_rel_mask(ggml_tensor * mask, const l
     const int64_t n_rows = hparams.is_swa(il) ? n_tps : std::max<int64_t>(32, (n_tps + 31)/32);
 
     if (n_rows >= n_tps) {
-        // [n_head, n_kv, n_tokens] -> [n_kv, n_tps, n_head, n_stream]
+        // [n_head, n_kv, n_tokens] -> [n_kv, n_tps, n_head, n_stream], in the type of the mask
         ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
         kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tps, n_stream);
-        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+        kq_b = ggml_permute(ctx0, kq_b, 2, 0, 1, 3);
+        kq_b = mask->type == GGML_TYPE_F32 ? ggml_cont(ctx0, kq_b) :
+            ggml_cpy(ctx0, kq_b, ggml_new_tensor_4d(ctx0, mask->type, n_kv, n_tps, n_head, n_stream));
 
-        kq_mask = ggml_add(ctx0, kq_b, mask->type == GGML_TYPE_F32 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F32));
-        if (mask->type != GGML_TYPE_F32) {
-            kq_mask = ggml_cast(ctx0, kq_mask, mask->type);
-        }
+        kq_mask = ggml_add(ctx0, kq_b, mask);
     } else {
         // the scheduler copies each view of an input to the device on its own, copy the whole input once instead
         rel_pos = ggml_cont(ctx0, rel_pos);

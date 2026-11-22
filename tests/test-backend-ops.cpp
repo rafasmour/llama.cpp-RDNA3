@@ -4282,6 +4282,172 @@ struct test_add_scale : public test_case {
     }
 };
 
+// tail of a causal convolution with input-dependent taps per head, as in Inkling 2
+struct test_dyn_conv_tail : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_conv;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DYN_CONV_TAIL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(head_dim, n_head, n_conv, n_seq_tokens, n_seqs);
+    }
+
+    test_dyn_conv_tail(int64_t head_dim = 128, int64_t n_head = 8, int64_t n_conv = 4, int64_t n_seq_tokens = 1, int64_t n_seqs = 1)
+        : head_dim(head_dim), n_head(n_head), n_conv(n_conv), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_ch     = head_dim*n_head;
+        const int64_t n_tokens = n_seq_tokens*n_seqs;
+
+        ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_conv - 1 + n_seq_tokens, n_ch, n_seqs);
+        ggml_tensor * dyn  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_conv*n_head, n_tokens);
+        ggml_tensor * base = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, n_tokens);
+        ggml_tensor * cur  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_set_name(dyn, "dyn");
+        ggml_set_name(base, "base");
+        ggml_set_name(cur, "cur");
+
+        ggml_tensor * xt  = ggml_cont(ctx, ggml_transpose(ctx, x));
+        ggml_tensor * dyn3 = ggml_reshape_3d(ctx, dyn, n_conv, n_head, n_tokens);
+
+        ggml_tensor * out = base;
+        for (int64_t lag = 0; lag < n_conv; ++lag) {
+            ggml_tensor * tap    = ggml_view_4d(ctx, dyn3, 1, n_head, n_seq_tokens, n_seqs,
+                    dyn3->nb[1], dyn3->nb[2], n_seq_tokens*dyn3->nb[2], lag*dyn3->nb[0]);
+            ggml_tensor * window = ggml_view_4d(ctx, xt, head_dim, n_head, n_seq_tokens, n_seqs,
+                    head_dim*xt->nb[0], xt->nb[1], xt->nb[2], (n_conv - 1 - lag)*xt->nb[1]);
+            out = ggml_add(ctx, out, ggml_reshape_2d(ctx, ggml_mul(ctx, window, tap), n_ch, n_tokens));
+        }
+
+        ggml_tensor * res = ggml_scale(ctx, ggml_add(ctx, cur, out), 1.0f/sqrtf(2*n_conv + 1));
+        ggml_set_name(res, "out");
+        return res;
+    }
+};
+
+// attention over the depth as in Inkling 2: rms_norm(cur) after the stacked blocks, softmax of the query scores, weighted sum
+struct test_depth_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t n_stack;
+    const int64_t n_query;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DEPTH_MIX";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_stack, n_query, n_tokens);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_depth_mix(int64_t n_embd = 512, int64_t n_stack = 3, int64_t n_query = 1, int64_t n_tokens = 1)
+        : n_embd(n_embd), n_stack(n_stack), n_query(n_query), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_query);
+        ggml_set_name(cur, "cur");
+        ggml_set_name(query, "query");
+
+        ggml_tensor * states = ggml_rms_norm(ctx, ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens), 1e-6f);
+        if (n_stack > 0) {
+            ggml_tensor * stack = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_stack, n_tokens);
+            ggml_set_name(stack, "stack");
+            states = ggml_concat(ctx, stack, states, 1);
+        }
+
+        ggml_tensor * scores = nullptr;
+        if (n_query == 1) {
+            scores = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, query, states), states->ne[1], 1, n_tokens);
+        } else {
+            ggml_tensor * queries = ggml_repeat(ctx, query, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_query, n_tokens));
+            scores = ggml_mul_mat(ctx, states, queries);
+        }
+        scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+
+        ggml_tensor * out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// per-expert weight scale of a MUL_MAT_ID result: REPEAT, GET_ROWS by the selected experts, MUL
+struct test_moe_expert_scale : public test_case {
+    const int64_t n0;
+    const int64_t n_expert;
+    const int64_t n_used;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_EXPERT_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n0, n_expert, n_used, n_tokens);
+    }
+
+    test_moe_expert_scale(int64_t n0 = 64, int64_t n_expert = 16, int64_t n_used = 4, int64_t n_tokens = 5)
+        : n0(n0), n_expert(n_expert), n_used(n_used), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * res = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n0, n_used, n_tokens);
+        ggml_tensor * ws  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_tensor * all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert, n_tokens);
+        ggml_set_name(res, "res");
+        ggml_set_name(ws, "ws");
+        ggml_set_name(all, "ids");
+
+        // the selected experts are the first n_used of each row, like a view of the argsort
+        ggml_tensor * ids = ggml_view_2d(ctx, all, n_used, n_tokens, all->nb[1], 0);
+
+        ggml_tensor * s = ggml_reshape_3d(ctx, ws, 1, n_expert, 1);
+        s = ggml_repeat_4d(ctx, s, 1, n_expert, n_tokens, 1);
+        s = ggml_get_rows(ctx, s, ids);
+
+        ggml_tensor * out = ggml_mul(ctx, res, s);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x5CA1E);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t r = 0; r < t->ne[1]; ++r) {
+                    std::vector<int32_t> perm(t->ne[0]);
+                    std::iota(perm.begin(), perm.end(), 0);
+                    std::shuffle(perm.begin(), perm.end(), gen);
+                    std::copy(perm.begin(), perm.end(), data.begin() + r*t->ne[0]);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
@@ -14650,6 +14816,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_tanh_gate({2304, 1, 1, 1}));
     test_cases.emplace_back(new test_tanh_gate({2304, 7, 1, 1}));
+    for (int64_t n_seq_tokens : {1, 7, 64}) {
+        test_cases.emplace_back(new test_dyn_conv_tail(128, 8, 4, n_seq_tokens, 1));
+    }
+    test_cases.emplace_back(new test_dyn_conv_tail(128, 8, 4, 5, 3));
+    test_cases.emplace_back(new test_dyn_conv_tail( 64, 3, 3, 9, 2));
+    for (int64_t n_stack : {0, 1, 5}) {
+        for (int64_t n_query : {1, 3, 4}) {
+            test_cases.emplace_back(new test_depth_mix(2304, n_stack, n_query, 1));
+        }
+    }
+    test_cases.emplace_back(new test_depth_mix(512, 7, 1, 9));
+    test_cases.emplace_back(new test_depth_mix(512, 7, 4, 33));
+    test_cases.emplace_back(new test_moe_expert_scale(64, 16, 4, 5));
+    test_cases.emplace_back(new test_moe_expert_scale(1152, 128, 8, 1));
+    test_cases.emplace_back(new test_moe_expert_scale(1152, 128, 8, 17));
     test_cases.emplace_back(new test_add_scale({2304, 1, 1, 1}));
     test_cases.emplace_back(new test_add_scale({1024, 7, 2, 1}, 0.2f, 0.5f));
 

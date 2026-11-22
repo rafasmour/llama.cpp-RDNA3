@@ -30,3 +30,10 @@ bool ggml_cuda_should_fuse_l2_clip(const ggml_tensor * x, const ggml_tensor * sc
 
 void ggml_cuda_op_l2_clip_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * scale,
         const ggml_tensor * norm_scale, const ggml_tensor * fill, const ggml_tensor * clamp, ggml_tensor * dst);
+
+#define GGML_CUDA_DEPTH_MIX_MAX_QUERY  4
+#define GGML_CUDA_DEPTH_MIX_MAX_STATES 64
+
+// stack [n_embd, n_stack, n_tokens] (or nullptr), cur [n_embd, n_tokens], query [n_embd, n_query], dst [n_embd, n_query, n_tokens]
+void ggml_cuda_op_depth_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * stack, const ggml_tensor * cur, const ggml_tensor * query,
+        float eps, float scale, ggml_tensor * dst);

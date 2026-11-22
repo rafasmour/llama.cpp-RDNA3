@@ -364,3 +364,48 @@ void ggml_cuda_op_ssm_conv_mul(ggml_backend_cuda_context & ctx, ggml_tensor * co
         ctx.q8_1_cache.set(q8_1_src1, q_args, mul);
     }
 }
+
+// the element-wise tail of a causal convolution with input-dependent taps per head (Inkling 2):
+//   dst = (cur + base + sum_j x[t + row_j] * tap_j[head, t]) * scale + bias
+// x is time major, [n_rows, n_channels, n_seqs] with n_rows = n_conv - 1 + n_seq_tokens; the products and sums keep the
+// order and the rounding of the separate MUL and ADD nodes
+static __global__ void dyn_conv_tail_f32(const float * __restrict__ x, const float * __restrict__ base, const float * __restrict__ cur,
+        const ggml_cuda_dyn_conv_taps taps, float * __restrict__ dst,
+        const int n_channels, const int n_seq_tokens, const int n_rows, const int head_dim, const int64_t n,
+        const float scale, const float bias) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int     c   = i % n_channels;
+    const int64_t t   = i / n_channels;
+    const int64_t seq = t / n_seq_tokens;
+    const int     tt  = t % n_seq_tokens;
+    const int     h   = c / head_dim;
+
+    const float * xc = x + (seq*n_channels + c)*n_rows + tt;
+
+    float acc = base[i];
+    for (int j = 0; j < taps.n; ++j) {
+        const float tap = taps.data[j][h*taps.nb1[j] + tt*taps.nb2[j] + seq*taps.nb3[j]];
+        acc = __fadd_rn(acc, __fmul_rn(xc[taps.row[j]], tap));
+    }
+    dst[i] = __fadd_rn(cur[i], acc)*scale + bias;
+}
+
+void ggml_cuda_op_dyn_conv_tail(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * base, const ggml_tensor * cur,
+        const ggml_cuda_dyn_conv_taps & taps, const int head_dim, const ggml_tensor * scale_node, ggml_tensor * dst) {
+    const int     n_channels   = dst->ne[0];
+    const int     n_rows       = x->ne[0];
+    const int     n_seq_tokens = n_rows - taps.n_conv + 1;
+    const int64_t n            = ggml_nelements(dst);
+
+    const float scale = ggml_get_op_params_f32(scale_node, 0);
+    const float bias  = ggml_get_op_params_f32(scale_node, 1);
+
+    const int block_size = 256;
+    const int64_t n_blocks = (n + block_size - 1) / block_size;
+    GGML_ASSERT(n_blocks <= INT_MAX);
+    dyn_conv_tail_f32<<<n_blocks, block_size, 0, ctx.stream()>>>((const float *) x->data, (const float *) base->data, (const float *) cur->data,
+        taps, (float *) dst->data, n_channels, n_seq_tokens, n_rows, head_dim, n, scale, bias);
+}
