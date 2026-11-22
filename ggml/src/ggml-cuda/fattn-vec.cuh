@@ -123,7 +123,7 @@ static __global__ void flash_attn_ext_vec(
     const char * V0 = V;
 
     const half * maskh  = mask ? (const half  *) (mask + nb33*(sequence % ne33) + nb32*(head % ne32) + nb31*ic0) : nullptr;
-    const fattn_indexed_bias head_bias = bias.table ? bias.offset(int64_t(sequence)*ne01.z + ic0, head) : bias;
+    const fattn_indexed_bias head_bias = bias.enabled() ? bias.offset(int64_t(sequence)*ne01.z + ic0, head) : bias;
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
@@ -315,7 +315,7 @@ static __global__ void flash_attn_ext_vec(
 
                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
                     float m = __half2float(maskh[j*ne11 + i_KQ]);
-                    if (head_bias.table) {
+                    if (head_bias.enabled()) {
                         m += head_bias.get(j, 0, k_VKQ_0 + i_KQ);
                     }
                     sum += slope*m;

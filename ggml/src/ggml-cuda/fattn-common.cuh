@@ -19,22 +19,39 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
-// optional bias added to the mask: table[indices[query, key], head, query], see ggml_flash_attn_ext_add_indexed_bias
-// table is offset to the first query of the sequence and to the first head of the block
+// optional bias added to the mask: table[indices[query, key], head, query] (F32 or F16) + offset_scale*offset[head, query],
+// see ggml_flash_attn_ext_add_indexed_bias; offset() moves the pointers to the first query of the sequence and the first head
 struct fattn_indexed_bias {
-    const float   * table;
+    const float   * table;   // F32 table or nullptr
+    const half    * table_h; // F16 table or nullptr
     const int32_t * indices;
+    const float   * bias_offset;
+    float   offset_scale;
     int32_t n_bins;
     int32_t n_keys;
     int32_t n_head;
 
+    __device__ __forceinline__ bool enabled() const {
+        return table || table_h;
+    }
+
     __device__ __forceinline__ fattn_indexed_bias offset(const int64_t query, const int head) const {
-        return {table + (query*n_head + head)*n_bins, indices + query*n_keys, n_bins, n_keys, n_head};
+        const int64_t t0 = (query*n_head + head)*n_bins;
+        return {table ? table + t0 : nullptr, table_h ? table_h + t0 : nullptr, indices + query*n_keys,
+                bias_offset ? bias_offset + query*n_head + head : nullptr, offset_scale, n_bins, n_keys, n_head};
     }
 
     __device__ __forceinline__ float get(const int query, const int head, const int key) const {
-        const int bin = indices[int64_t(query)*n_keys + key];
-        return uint32_t(bin) < uint32_t(n_bins) ? table[(int64_t(query)*n_head + head)*n_bins + bin] : 0.0f;
+        const int     bin = indices[int64_t(query)*n_keys + key];
+        const int64_t t   = (int64_t(query)*n_head + head)*n_bins + bin;
+        float v = 0.0f;
+        if (uint32_t(bin) < uint32_t(n_bins)) {
+            v = table ? table[t] : __half2float(table_h[t]);
+        }
+        if (bias_offset) {
+            v += offset_scale*bias_offset[int64_t(query)*n_head + head];
+        }
+        return v;
     }
 };
 
@@ -1089,6 +1106,7 @@ void launch_fattn(
 
     const ggml_tensor * bias_table   = dst->src[6];
     const ggml_tensor * bias_indices = dst->src[7];
+    const ggml_tensor * bias_offset  = dst->src[8];
     GGML_ASSERT(!bias_table || (!use_sparse && ncols2 == 1 && mask && mask->ne[2] == 1));
 
     // with kv_rows the kernel iterates over the mask columns and reads K/V rows through kv_rows
@@ -1371,8 +1389,11 @@ void launch_fattn(
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
         fattn_indexed_bias{
-            bias_table   ? (const float   *) bias_table->data   : nullptr,
+            bias_table && bias_table->type == GGML_TYPE_F32 ? (const float *) bias_table->data : nullptr,
+            bias_table && bias_table->type == GGML_TYPE_F16 ? (const half  *) bias_table->data : nullptr,
             bias_indices ? (const int32_t *) bias_indices->data : nullptr,
+            bias_offset  ? (const float   *) bias_offset->data  : nullptr,
+            bias_offset  ? ggml_get_op_params_f32(KQV, 6) : 0.0f,
             bias_table   ? (int32_t) bias_table->ne[0]   : 0,
             bias_indices ? (int32_t) bias_indices->ne[0] : 0,
             (int32_t) Q->ne[2]}

@@ -727,7 +727,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             if (!oob_check || i_KQ < k_VKQ_sup) {
                 if (ncols2 > 1 || mask) {
                     float m = __half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]);
-                    if (bias.table) {
+                    if (bias.enabled()) {
                         m += bias.get(j, 0, k_VKQ_0 + i_KQ);
                     }
                     KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += slope*m;
@@ -964,7 +964,7 @@ static __global__ void flash_attn_tile(
     const half2 * V_h2 = (const half2 *) (V + nb23*sequence + nb22*(head0 / gqa_ratio)); // K and V have same shape
 
     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33) + nb32*(head0 % ne32)) : nullptr;
-    const fattn_indexed_bias head_bias = bias.table ? bias.offset(int64_t(sequence)*ne01.z, head0) : bias;
+    const fattn_indexed_bias head_bias = bias.enabled() ? bias.offset(int64_t(sequence)*ne01.z, head0) : bias;
 
     // K/V rows of this sequence, one per mask column
     const int32_t * rows = nullptr;
