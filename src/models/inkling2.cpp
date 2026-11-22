@@ -321,13 +321,19 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     const int64_t n_embd_head  = hparams.n_embd_head_k(il);
     const int64_t n_embd_k_gqa = n_embd_head*n_head_kv;
 
+    // a view of rows, copied only when it is not contiguous (several tokens)
+    auto rows = [&](ggml_tensor * view) {
+        return ggml_is_contiguous(view) ? view : ggml_cont(ctx0, view);
+    };
+
     // the message of controller ctrl, [n_embd, n_tokens]
     auto message = [&](int ctrl) {
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
+        return rows(ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
     };
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
-    ggml_tensor * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
+    // each convolution reads its slice of the state before it writes it back, the state can be read in place
+    ggml_tensor * history = build_rs_in_place(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
     history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
 
     ggml_tensor * inpSA = cur;
@@ -337,7 +343,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     if (layer.attn_res_query) {
         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
         for (int j = 0; j < 3; ++j) {
-            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+            inputs[j] = rows(ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
         }
     }
 
