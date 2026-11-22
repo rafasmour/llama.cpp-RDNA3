@@ -2567,6 +2567,7 @@ struct llama_model_inkling2 : public llama_model_base {
 
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
+        ggml_tensor * zero_sinks  = nullptr;
 
         std::map<std::vector<ggml_tensor *>, ggml_tensor *> stacks; // see stack()
     };

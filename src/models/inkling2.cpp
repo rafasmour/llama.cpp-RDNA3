@@ -293,6 +293,9 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     tau = ggml_log(ctx0, ggml_clamp(ctx0, ggml_scale(ctx0, tau, 1.0f/hparams.n_log_scale_floor), 1.0f, INFINITY));
     tau = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, tau, hparams.f_log_scale_alpha, 1.0f), 1, 1, n_tokens);
 
+    // the sink logits are folded into the bias table, the attention gets zero sinks
+    zero_sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.n_head()), 0.0f);
+
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
 
     // important: do not normalize raw embeddings input (i.e. encoded image embeddings)
@@ -389,7 +392,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
         cb(table, "rel_bias", il);
 
-        sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+        sinks = zero_sinks->ne[0] == n_head ? zero_sinks : ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
 
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
