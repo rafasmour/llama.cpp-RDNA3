@@ -63,3 +63,27 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
                                   (float *) dst->data, n_embd, n_tokens, (int) n_expert_used, stream);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// per-expert weight scale of a MUL_MAT_ID result: dst[:, k, t] = res[:, k, t] * scale[ids[k, t]] (REPEAT, GET_ROWS and MUL)
+static __global__ void moe_expert_scale_f32(const float * __restrict__ res, const float * __restrict__ scale, const int32_t * __restrict__ ids,
+        float * __restrict__ dst, const int64_t n0, const int n_used, const int n_expert, const int64_t ids_nb0, const int64_t ids_nb1, const int64_t n) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int64_t row = i / n0;
+    const int     k   = row % n_used;
+    const int64_t t   = row / n_used;
+    const int32_t id  = ids[k*ids_nb0 + t*ids_nb1];
+    dst[i] = res[i] * (uint32_t(id) < uint32_t(n_expert) ? scale[id] : 0.0f);
+}
+
+void ggml_cuda_op_moe_expert_scale(ggml_backend_cuda_context & ctx, const ggml_tensor * res, const ggml_tensor * scale, const ggml_tensor * ids,
+        ggml_tensor * dst) {
+    const int64_t n = ggml_nelements(dst);
+    const int block_size = 256;
+    const int64_t n_blocks = (n + block_size - 1) / block_size;
+    GGML_ASSERT(n_blocks <= INT_MAX);
+    moe_expert_scale_f32<<<n_blocks, block_size, 0, ctx.stream()>>>((const float *) res->data, (const float *) scale->data, (const int32_t *) ids->data,
+        (float *) dst->data, res->ne[0], res->ne[1], ggml_nelements(scale), ids->nb[0]/sizeof(int32_t), ids->nb[1]/sizeof(int32_t), n);
+}

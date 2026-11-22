@@ -1159,3 +1159,93 @@ void ggml_cuda_op_l2_clip_fused(ggml_backend_cuda_context & ctx, const ggml_tens
         x->ne[0], x->ne[1], x->ne[2], x->ne[3], x->nb[1]/ts, x->nb[2]/ts, x->nb[3]/ts,
         scale ? scale->ne[1] : 1, scale ? scale->ne[2] : 1, scale ? scale->ne[3] : 1, a, b, c, lo, hi, ctx.stream());
 }
+
+// attention over the depth (Inkling 2), one block per token:
+//   states = [stack rows..., rms_norm(cur)], p_q = softmax(scale * states . query_q), dst_q = sum_s p_q[s] * states[s]
+#define DEPTH_MIX_BLOCK_SIZE 256
+static __global__ void depth_mix_f32(const float * __restrict__ stack, const float * __restrict__ cur, const float * __restrict__ query,
+        float * __restrict__ dst, const int n_embd, const int n_stack, const int n_query, const float eps, const float scale) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int n_warps   = DEPTH_MIX_BLOCK_SIZE / warp_size;
+    __shared__ float s_sum[32];
+    __shared__ float s_p[GGML_CUDA_DEPTH_MIX_MAX_QUERY*GGML_CUDA_DEPTH_MIX_MAX_STATES];
+
+    const int64_t t   = blockIdx.x;
+    const int     tid = threadIdx.x;
+    const int     n_states = n_stack + 1;
+
+    const float * cur_t   = cur   + t*n_embd;
+    const float * stack_t = stack + t*n_stack*n_embd;
+
+    float tmp = 0.0f;
+    for (int e = tid; e < n_embd; e += DEPTH_MIX_BLOCK_SIZE) {
+        tmp += cur_t[e]*cur_t[e];
+    }
+    tmp = block_reduce<block_reduce_method::SUM, DEPTH_MIX_BLOCK_SIZE>(tmp, s_sum);
+    const float rs = rsqrtf(tmp/n_embd + eps);
+
+    const int warp = tid / warp_size;
+    const int lane = tid % warp_size;
+    for (int p = warp; p < n_states*n_query; p += n_warps) {
+        const int s = p % n_states;
+        const int q = p / n_states;
+        const float * qv = query + q*n_embd;
+        float dot = 0.0f;
+        if (s < n_stack) {
+            const float * st = stack_t + s*n_embd;
+            for (int e = lane; e < n_embd; e += warp_size) {
+                dot += st[e]*qv[e];
+            }
+        } else {
+            for (int e = lane; e < n_embd; e += warp_size) {
+                dot += (cur_t[e]*rs)*qv[e];
+            }
+        }
+        dot = warp_reduce_sum<warp_size>(dot);
+        if (lane == 0) {
+            s_p[q*n_states + s] = dot*scale;
+        }
+    }
+    __syncthreads();
+
+    if (tid < n_query) {
+        float * pq = s_p + tid*n_states;
+        float mx = -INFINITY;
+        for (int s = 0; s < n_states; ++s) {
+            mx = fmaxf(mx, pq[s]);
+        }
+        float sum = 0.0f;
+        for (int s = 0; s < n_states; ++s) {
+            pq[s] = expf(pq[s] - mx);
+            sum += pq[s];
+        }
+        for (int s = 0; s < n_states; ++s) {
+            pq[s] /= sum;
+        }
+    }
+    __syncthreads();
+
+    for (int e = tid; e < n_embd; e += DEPTH_MIX_BLOCK_SIZE) {
+        const float xc = cur_t[e]*rs;
+        for (int q = 0; q < n_query; ++q) {
+            const float * pq = s_p + q*n_states;
+            float acc = 0.0f;
+            for (int s = 0; s < n_stack; ++s) {
+                acc += pq[s]*stack_t[s*n_embd + e];
+            }
+            acc += pq[n_stack]*xc;
+            dst[(t*n_query + q)*n_embd + e] = acc;
+        }
+    }
+}
+
+void ggml_cuda_op_depth_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * stack, const ggml_tensor * cur, const ggml_tensor * query,
+        const float eps, const float scale, ggml_tensor * dst) {
+    const int n_embd  = dst->ne[0];
+    const int n_query = dst->ne[1];
+    const int n_stack = stack ? stack->ne[1] : 0;
+    const int64_t n_tokens = dst->ne[2];
+    GGML_ASSERT(n_tokens <= INT_MAX);
+    depth_mix_f32<<<n_tokens, DEPTH_MIX_BLOCK_SIZE, 0, ctx.stream()>>>(stack ? (const float *) stack->data : nullptr, (const float *) cur->data,
+        (const float *) query->data, (float *) dst->data, n_embd, n_stack, n_query, eps, scale);
+}
