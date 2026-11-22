@@ -1497,6 +1497,8 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    // build_rs_in_place() reads the states through a view when the copy is the identity
+    res &= inp_rs->s_copy_identity == mctx->get_recr()->is_s_copy_identity(params.ubatch.n_seqs);
 
     return res;
 }
