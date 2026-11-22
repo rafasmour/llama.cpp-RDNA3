@@ -15148,6 +15148,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Inkling 2: sigmoid with a selection bias, 128 experts, 8 used, norm with an additive epsilon
+    for (float scale_w : {0.0f, 2.5f}) {
+        test_cases.emplace_back(new test_topk_moe({128,  1, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, scale_w, 1, true));
+        test_cases.emplace_back(new test_topk_moe({128, 17, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, scale_w, 1, true));
+    }
+
     // sigmoid scoring always ranks a selection bias (GLM, DeepSeek-V2/V3.2)
     for (float scale_w : {0.0f, 2.0f}) {
         test_cases.emplace_back(new test_topk_moe({8, 22, 1, 1}, 4, true, true, GATING_FUNC_SIGMOID, scale_w, 1, true));
