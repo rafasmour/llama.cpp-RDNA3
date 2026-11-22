@@ -2570,7 +2570,6 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * zero_sinks  = nullptr;
 
         std::map<std::vector<ggml_tensor *>, ggml_tensor *> stacks; // see stack()
-        std::map<const ggml_tensor *, ggml_tensor *>          rel_bias_padded; // relative-position bias table + a zero bucket
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

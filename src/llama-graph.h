@@ -1095,10 +1095,13 @@ struct llm_graph_amax_src1 {
     ggml_tensor * scale_s; // scale to undo on the matmul result, or nullptr
 };
 
-// relative-position bias of llm_graph_input_mem_hybrid_iswa_rel: table[indices[key, query], head, query] is added to the KQ mask
+// relative-position bias of llm_graph_input_mem_hybrid_iswa_rel: table[indices[key, query], head, query] + offset_scale*offset[head, query]
+// is added to the KQ mask; the index n_bins (a cell farther than the extent) selects the offset alone
 struct llm_graph_rel_bias {
-    ggml_tensor * table;   // [n_bins, n_head_q, n_tokens], F32
+    ggml_tensor * table;   // [n_bins, n_head_q, n_tokens], F32 or F16
     ggml_tensor * indices; // [n_kv, n_tokens], I32
+    ggml_tensor * offset;  // [n_head_q, n_tokens], F32
+    float         offset_scale;
     ggml_tensor * rows;    // [n_tokens], I32, row indices for the chunked dense mask
 };
 
@@ -1575,7 +1578,9 @@ struct llm_graph_context {
             ggml_tensor * q_cur,    // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur,    // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur,    // [n_embd_head_v, n_head_v, n_tokens]
-            ggml_tensor * rel_bias, // [extent + 1, n_head_q, n_tokens]
+            ggml_tensor * rel_bias, // [extent, n_head_q, n_tokens], F32 or F16
+            ggml_tensor * rel_offset, // [n_head_q, n_tokens], added with rel_offset_scale to the bias of every cell
+                  float   rel_offset_scale,
             ggml_tensor * sinks,    // [n_head_q]
                   float   kq_scale,
                     int   il) const;

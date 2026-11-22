@@ -3184,6 +3184,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (rel_bias) {
             GGML_ASSERT(kv_rows == nullptr);
             ggml_flash_attn_ext_add_indexed_bias(cur, rel_bias->table, rel_bias->indices);
+            ggml_flash_attn_ext_add_indexed_bias_offset(cur, rel_bias->offset, rel_bias->offset_scale);
             ggml_backend_dev_t dev = model.dev_layer(il);
             if (!cparams.offload_kqv || !dev || !ggml_backend_dev_supports_op(dev, cur)) {
                 ggml_flash_attn_ext_add_indexed_bias(cur, nullptr, nullptr);
@@ -4454,8 +4455,14 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
 }
 
 ggml_tensor * llm_graph_context::build_attn_rel_mask(ggml_tensor * mask, const llm_graph_rel_bias & rel_bias, int il) const {
+    // the dense mask gathers from a table with a bin for the cells farther than the extent, and the offset in every bin
+    ggml_tensor * table = rel_bias.table->type == GGML_TYPE_F32 ? rel_bias.table : ggml_cast(ctx0, rel_bias.table, GGML_TYPE_F32);
+    table = ggml_pad(ctx0, table, 1, 0, 0, 0);
+    table = ggml_add(ctx0, table, ggml_scale(ctx0,
+            ggml_reshape_3d(ctx0, rel_bias.offset, 1, rel_bias.offset->ne[0], rel_bias.offset->ne[1]), rel_bias.offset_scale));
+
     // [n_bins, n_head, n_tokens] -> [n_head, n_bins, n_tokens]
-    ggml_tensor * table   = ggml_cont(ctx0, ggml_permute(ctx0, rel_bias.table, 1, 0, 2, 3));
+    table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
     ggml_tensor * rel_pos = rel_bias.indices; // [n_kv, n_tokens]
 
     const int64_t n_kv     = mask->ne[0];
@@ -4522,6 +4529,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * k_cur,
         ggml_tensor * v_cur,
         ggml_tensor * rel_bias,
+        ggml_tensor * rel_offset,
+              float   rel_offset_scale,
         ggml_tensor * sinks,
             float     kq_scale,
             int       il) const {
@@ -4534,7 +4543,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // TODO: support kv_rows - fill the distances over the kv_rows cell lists and pass the rows to build_attn_mha
     GGML_ASSERT(attn_mask.rows == nullptr);
 
-    const llm_graph_rel_bias bias = { rel_bias, is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos, inp->self_rows };
+    const llm_graph_rel_bias bias = { rel_bias, is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos, rel_offset, rel_offset_scale, inp->self_rows };
 
     return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, attn_mask.raw, nullptr, sinks, nullptr, kq_scale, il, &bias);
 }
