@@ -107,6 +107,11 @@ void ggml_cuda_op_dot_sigmoid_gate_add(
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
+bool ggml_cuda_should_fuse_tanh_gate(const ggml_tensor * cur, const ggml_tensor * f, const ggml_tensor * g, const ggml_tensor * msg, const ggml_tensor * dst);
+
+void ggml_cuda_op_tanh_gate_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * cur, const ggml_tensor * f, const ggml_tensor * g,
+        const ggml_tensor * msg, ggml_tensor * dst);
+
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));
 }

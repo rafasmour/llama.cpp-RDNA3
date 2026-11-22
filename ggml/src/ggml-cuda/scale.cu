@@ -63,3 +63,32 @@ void ggml_cuda_op_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         scale_f32_cuda((const float *) src0->data, (float *) dst->data, scale, bias, src0, dst, stream);
     }
 }
+
+// fused add + scale: dst = (a + b)*scale + bias, for a and b of the same shape
+static __global__ void add_scale_f32(const float * a, const float * b, float * dst, const float scale, const float bias, const int64_t k) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    dst[i] = (a[i] + b[i])*scale + bias;
+}
+
+bool ggml_cuda_should_fuse_add_scale(const ggml_tensor * add, const ggml_tensor * scale) {
+    const ggml_tensor * tensors[] = { add->src[0], add->src[1], add, scale };
+    for (const ggml_tensor * t : tensors) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, scale)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void ggml_cuda_op_add_scale_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * add, ggml_tensor * scale) {
+    const float s = ggml_get_op_params_f32(scale, 0);
+    const float b = ggml_get_op_params_f32(scale, 1);
+    const int64_t k = ggml_nelements(scale);
+    const int64_t num_blocks = (k + CUDA_SCALE_BLOCK_SIZE - 1) / CUDA_SCALE_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+    add_scale_f32<<<num_blocks, CUDA_SCALE_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const float *) add->src[0]->data, (const float *) add->src[1]->data, (float *) scale->data, s, b, k);
+}

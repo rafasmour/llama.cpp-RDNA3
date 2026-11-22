@@ -814,6 +814,9 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
+    // 0, 1, ..., the query rows that the per-head KQ mask is written to
+    ggml_tensor * self_rows = nullptr; // I32 [n_batch]
+
     const uint32_t extent;
     const uint32_t extent_swa;
 
@@ -1092,6 +1095,13 @@ struct llm_graph_amax_src1 {
     ggml_tensor * scale_s; // scale to undo on the matmul result, or nullptr
 };
 
+// relative-position bias of llm_graph_input_mem_hybrid_iswa_rel: table[indices[key, query], head, query] is added to the KQ mask
+struct llm_graph_rel_bias {
+    ggml_tensor * table;   // [n_bins, n_head_q, n_tokens], F32
+    ggml_tensor * indices; // [n_kv, n_tokens], I32
+    ggml_tensor * rows;    // [n_tokens], I32, row indices for the chunked dense mask
+};
+
 struct llm_graph_context {
     const llama_model & model;
 
@@ -1346,7 +1356,11 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            const llm_graph_rel_bias * rel_bias = nullptr) const;
+
+    // the dense KQ mask with the relative-position bias added, for the backends without the indexed bias in flash attention
+    ggml_tensor * build_attn_rel_mask(ggml_tensor * kq_mask, const llm_graph_rel_bias & rel_bias, int il) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1551,17 +1565,18 @@ struct llm_graph_context {
             uint32_t extent,
             uint32_t extent_swa) const;
 
-    // kq_b is added to the KQ mask, after the KQ scale
+    // rel_bias holds the bias of each query and head by distance bucket, it is gathered by the distance to
+    // each cell and added to the KQ mask, after the KQ scale. flash attention gathers it itself where the backend can
     ggml_tensor * build_attn(
             llm_graph_input_mem_hybrid_iswa_rel * inp,
             ggml_tensor * wo,
             ggml_tensor * wo_b,
             ggml_tensor * wo_s,
-            ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
-            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
-            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
-            ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
-            ggml_tensor * sinks, // [n_head_q]
+            ggml_tensor * q_cur,    // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur,    // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur,    // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * rel_bias, // [extent + 1, n_head_q, n_tokens]
+            ggml_tensor * sinks,    // [n_head_q]
                   float   kq_scale,
                     int   il) const;
 

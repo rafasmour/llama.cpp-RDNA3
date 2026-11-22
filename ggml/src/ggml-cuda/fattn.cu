@@ -687,13 +687,22 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const bool kv_rows_rdna3 = kv_rows && amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA3_0(cc) && mask &&
         K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
     if (kv_rows && !kv_rows_rdna3) {
-        return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && mask && Q->ne[0] != 40 && Q->ne[0] != 72 ?
+        return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && mask && Q->ne[0] != 40 && Q->ne[0] != 72 &&
+            !ggml_flash_attn_ext_has_indexed_bias(dst) ?
             BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && n_kv % FATTN_KQ_STRIDE == 0;
+
+    // only the vec kernel and the tile kernel without the GQA optimization add the indexed bias
+    if (ggml_flash_attn_ext_has_indexed_bias(dst)) {
+        if ((Q->ne[0] != 64 && Q->ne[0] != 128 && Q->ne[0] != 256) || V->ne[0] != Q->ne[0]) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        return Q->ne[1] <= 2 && can_use_vector_kernel ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_TILE;
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc)) {

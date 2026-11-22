@@ -5763,6 +5763,57 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // clip of the row l2 norms, optionally after a MUL: [MUL] SQR SUM_ROWS SQRT SCALE FILL DIV CLAMP MUL
+    if (node->op == GGML_OP_MUL || node->op == GGML_OP_SQR) {
+        static const ggml_op clip_ops[] = { GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE,
+                                            GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
+        const int n_ops     = node->op == GGML_OP_MUL ? 9 : 8;
+        const int j         = i + n_ops - 8; // the SQR
+        const int outputs[] = { i + n_ops - 1 };
+        if (ggml_can_fuse_subgraph(cgraph, i, n_ops, clip_ops + 9 - n_ops, outputs, 1) &&
+                ggml_check_edges(cgraph, j, {{1, 0, 0}, {2, 0, 1}, {3, 0, 2}, {4, 0, 3}, {5, 0, 4}, {5, 1, 3}, {6, 0, 5}, {7, 1, 6}})) {
+            ggml_tensor * const * nd = cgraph->nodes + j;
+            const ggml_tensor * y     = nd[0]->src[0];
+            const ggml_tensor * x     = n_ops == 9 ? node->src[0] : y;
+            const ggml_tensor * scale = n_ops == 9 ? node->src[1] : nullptr;
+            if ((n_ops == 8 || y == node) && nd[7]->src[0] == y && ggml_are_same_shape(y, x) &&
+                    ggml_cuda_should_fuse_l2_clip(x, scale, nd[7]) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, outputs, 1)) {
+                ggml_cuda_op_l2_clip_fused(*cuda_ctx, x, scale, nd[3], nd[4], nd[6], nd[7]);
+                return n_ops - 1;
+            }
+        }
+    }
+
+    // gate: (cur - tanh(f)*cur) + tanh(g)*msg
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_TANH) {
+        const ggml_op ops[]     = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+        const int     outputs[] = { i + 5 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 6, ops, outputs, 1) &&
+                ggml_get_unary_op(cgraph->nodes[i + 3]) == GGML_UNARY_OP_TANH &&
+                ggml_check_edges(cgraph, i, {{1, 0, 0}, {2, 1, 1}, {4, 0, 3}, {5, 0, 2}, {5, 1, 4}}) &&
+                cgraph->nodes[i + 2]->src[0] == cgraph->nodes[i + 1]->src[1]) {
+            const ggml_tensor * cur = cgraph->nodes[i + 1]->src[1];
+            const ggml_tensor * msg = cgraph->nodes[i + 4]->src[1];
+            if (ggml_cuda_should_fuse_tanh_gate(cur, node->src[0], cgraph->nodes[i + 3]->src[0], msg, cgraph->nodes[i + 5]) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, outputs, 1)) {
+                ggml_cuda_op_tanh_gate_fused(*cuda_ctx, cur, node->src[0], cgraph->nodes[i + 3]->src[0], msg, cgraph->nodes[i + 5]);
+                return 5;
+            }
+        }
+    }
+
+    if (node->op == GGML_OP_ADD && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_SCALE) {
+        const ggml_op ops[]     = { GGML_OP_ADD, GGML_OP_SCALE };
+        const int     outputs[] = { i + 1 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 2, ops, outputs, 1) && cgraph->nodes[i + 1]->src[0] == node &&
+                ggml_cuda_should_fuse_add_scale(node, cgraph->nodes[i + 1]) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, outputs, 1)) {
+            ggml_cuda_op_add_scale_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+            return 1;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
